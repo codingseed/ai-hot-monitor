@@ -1,4 +1,4 @@
-# 热探 Signal Desk 需求说明
+# AI 热探 Signal Desk 需求说明
 
 ## 1. 背景与目标
 

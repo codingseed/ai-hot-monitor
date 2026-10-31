@@ -1,4 +1,4 @@
-# 热探 Signal Desk 方案设计
+# AI 热探 Signal Desk 方案设计
 
 ## 1. 设计原则
 

@@ -1,6 +1,6 @@
 ---
 name: ai-hot-monitor
-description: Monitor AI, software, product launches, and user-defined topics across Chinese and international sources; verify evidence before reporting; optionally read the local 热探 dashboard.
+description: Monitor AI, software, product launches, and user-defined topics across Chinese and international sources; verify evidence before reporting; optionally read the local AI 热探 dashboard.
 ---
 
 # AI Hot Monitor

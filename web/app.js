@@ -130,7 +130,7 @@ function renderStories(stories) {
   }
   for (const story of filtered) {
     const row = document.createElement('article');
-    row.className = 'story-row';
+    row.className = 'story-row spotlight';
     const main = document.createElement('div');
     main.className = 'story-main';
     const meta = document.createElement('div');
@@ -259,9 +259,22 @@ function render(state) {
   }
 }
 
+let lastStoriesSignature = '';
 async function refresh() {
   try {
-    render(await api('/api/state'));
+    const state = await api('/api/state');
+    const signature = JSON.stringify(state.stories.map((s) => [s.id, s.urgency, s.relevance_score, s.verdict, s.summary_zh, s.title]));
+    const changed = signature !== lastStoriesSignature;
+    lastStoriesSignature = signature;
+    if (changed) render(state);
+    else {
+      dashboard = state;
+      updateSchedule(state);
+      setText('#metric-total', String(state.stories.length).padStart(2, '0'));
+      setText('#metric-urgent', String(state.stories.filter((s) => s.urgency === 'urgent').length).padStart(2, '0'));
+      setText('#metric-high', String(state.stories.filter((s) => s.urgency === 'high').length).padStart(2, '0'));
+      setText('#metric-keywords', String(state.keywords.length));
+    }
   } catch (error) {
     setText('#live-label', '服务连接失败');
     showToast(`无法读取监控数据：${error.message}`, true);
@@ -370,4 +383,46 @@ $('#settings-form').addEventListener('input', () => {
 
 connectRealtime();
 refresh();
-setInterval(refresh, 15_000);
+// Lightweight scan watcher: refresh only when a scan finishes, avoiding UI flicker.
+let lastScanFinished = null;
+setInterval(async () => {
+  try {
+    const state = await api('/api/state');
+    if (state.last_scan && state.last_scan !== lastScanFinished) {
+      lastScanFinished = state.last_scan;
+      render(state);
+    }
+  } catch { /* ignore */ }
+}, 30_000);
+
+
+// Spotlight tracking for tech cards (only the hovered card)
+document.addEventListener('mousemove', (event) => {
+  const target = event.target && event.target.closest ? event.target.closest('.spotlight') : null;
+  if (target) {
+    const rect = target.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * 100;
+    const y = ((event.clientY - rect.top) / rect.height) * 100;
+    target.style.setProperty('--mx', `${x}%`);
+    target.style.setProperty('--my', `${y}%`);
+  }
+});
+
+
+// Typewriter effect for hero subtitle
+window.addEventListener('DOMContentLoaded', () => {
+  const el = document.querySelector('.page-heading p');
+  if (!el) return;
+  const full = el.textContent;
+  el.textContent = '';
+  let i = 0;
+  const tick = () => {
+    if (i <= full.length) {
+      el.textContent = full.slice(0, i);
+      i++;
+      setTimeout(tick, 45);
+    }
+  };
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) tick();
+  else el.textContent = full;
+});
