@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7f4">
+  <title>热探 | AI 热点监控</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#overview" aria-label="热探首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>热探</strong><small>Signal Desk</small></span>
+      </a>
+      <div class="workspace-label">工作区</div>
+      <nav class="primary-nav">
+        <a class="nav-link active" href="#overview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="5" rx="1"/><rect x="13" y="10" width="8" height="11" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/></svg>监控总览</a>
+        <a class="nav-link" href="#watchlist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10Z"/><path d="M8 12h2l1-2 2 4 1-2h2"/></svg>关注关键词 <span id="nav-count" class="nav-count">0</span></a>
+        <a class="nav-link" href="#settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.7-1l-1.7.7-1.4-2.4 1.4-1.1a7 7 0 0 1 0-2l-1.4-1.1 1.4-2.4 1.7.7a8 8 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.7 1l1.7-.7 1.4 2.4-1.4 1.1a7 7 0 0 1-.1 1.9Z"/></svg>连接与设置</a>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-foot">
+        <div class="avatar">L</div>
+        <div class="profile"><strong>Leo 的雷达</strong><span>本地工作区</span></div>
+        <span class="local-dot" title="数据保存在本机"></span>
+      </div>
+    </aside>
+
+    <main class="main-content" id="overview">
+      <header class="topbar">
+        <div class="breadcrumb"><span>工作区</span><span class="slash">/</span><strong>监控总览</strong></div>
+        <div class="top-actions">
+          <span class="live-state"><span class="live-pulse"></span><span id="live-label">正在连接</span></span>
+          <button class="icon-button mobile-menu" aria-label="打开导航" title="打开导航"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+          <button id="scan-button" class="button button-primary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9a7 7 0 0 1 11.6-2L20 12M4 12l2.9 5a7 7 0 0 0 11.6-2"/></svg><span>立即扫描</span></button>
+        </div>
+      </header>
+
+      <div class="content-wrap">
+        <section class="page-heading">
+          <div>
+            <div class="eyebrow"><span class="eyebrow-line"></span>周六 · 你的 AI 情报站</div>
+            <h1>热点，不等人。</h1>
+            <p>关注变化，核验消息，把第一手信号送到你手边。</p>
+          </div>
+          <div class="heading-meta"><span class="meta-label">下次自动扫描</span><strong id="next-scan">启动中</strong></div>
+        </section>
+
+        <section class="metrics" aria-label="监控概况">
+          <article class="metric metric-dark"><div class="metric-top"><span>已发现热点</span><span class="metric-icon">↗</span></div><strong id="metric-total">—</strong><small>累计收录</small><div class="metric-chart" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+          <article class="metric"><div class="metric-top"><span>紧急热点</span><span class="metric-symbol urgent">!</span></div><strong id="metric-urgent">—</strong><small>需优先关注</small><div class="metric-foot"><span class="mini-bar urgent-bar"></span><span>最高优先级</span></div></article>
+          <article class="metric"><div class="metric-top"><span>高优先级</span><span class="metric-symbol pending">↑</span></div><strong id="metric-high">—</strong><small>重点跟进</small><div class="metric-foot"><span class="mini-bar pending-bar"></span><span>及时处理</span></div></article>
+          <article class="metric"><div class="metric-top"><span>关注关键词</span><span class="metric-symbol keyword">#</span></div><strong id="metric-keywords">0</strong><small>持续追踪中</small><div class="metric-foot"><span class="mini-bar keyword-bar"></span><a href="#watchlist">管理关注词 <span aria-hidden="true">→</span></a></div></article>
+        </section>
+
+        <div class="dashboard-grid">
+          <section class="feed-panel" aria-labelledby="feed-title">
+            <div class="section-heading feed-heading">
+              <div><div class="section-kicker">LIVE INTELLIGENCE</div><h2 id="feed-title">最新信号</h2></div>
+              <div class="feed-controls">
+                                <label class="select-wrap"><span class="sr-only">筛选热点紧急度</span><select id="story-filter"><option value="all">全部紧急度</option><option value="urgent">紧急</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></label>
+                <button id="refresh-button" class="icon-button" title="刷新列表" aria-label="刷新列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9a7 7 0 0 1 11.6-2L20 12M4 12l2.9 5a7 7 0 0 0 11.6-2"/></svg></button>
+              </div>
+            </div>
+            <div id="story-list" class="story-list" aria-live="polite"><div class="loading-state"><span class="spinner"></span>正在整理最新信号…</div></div>
+            <div id="empty-state" class="empty-state" hidden><span class="empty-mark">S.</span><h3>雷达已就位</h3><p>热点出现后会在这里经过核验并整理。也可以先添加你特别关注的关键词。</p><a href="#watchlist" class="text-link">设置关注关键词 <span aria-hidden="true">→</span></a></div>
+            <div class="feed-footer"><span id="feed-count">等待首次扫描</span><span class="source-note"><span class="source-dot"></span>国内 / 全球 RSS · X</span></div>
+          </section>
+
+          <aside class="right-rail">
+            <section id="watchlist" class="rail-section watch-section">
+              <div class="section-heading compact-heading"><div><div class="section-kicker">YOUR RADAR</div><h2>关注关键词</h2></div><span class="count-pill" id="keyword-count">0</span></div>
+              <form id="keyword-form" class="keyword-form">
+                <label for="keyword-input" class="sr-only">添加要监控的关键词</label>
+                <input id="keyword-input" type="text" placeholder="例如：Claude 新模型" maxlength="100" autocomplete="off" required>
+                <button class="add-button" type="submit" aria-label="添加关键词" title="添加关键词"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+              </form>
+              <div id="keyword-list" class="keyword-list"><span class="muted-copy">暂时还没有关注词</span></div>
+              <div class="tip-line"><span class="tip-dot"></span>每个关键词都会单独检索和追踪</div>
+            </section>
+
+            <section class="rail-section verification-card">
+              <div class="verify-top"><span class="verify-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19 6v5c0 5-3 8-7 10-4-2-7-5-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg></span><span id="ai-status" class="status-pill status-off">未配置</span></div>
+              <h3>先核验，再提醒</h3>
+              <p>模型会结合报道来源、摘要和交叉线索识别冒名与未经证实的消息。</p>
+              <a href="#settings" class="text-link">配置核验与通知 <span aria-hidden="true">→</span></a>
+            </section>
+
+            <section class="rail-section scan-card">
+              <div class="section-heading compact-heading"><div><div class="section-kicker">SCAN RHYTHM</div><h2>扫描节奏</h2></div><span class="scan-orbit" aria-hidden="true"><i></i></span></div>
+              <div class="scan-frequency"><strong id="interval-display">每 30 分钟</strong><span>自動巡检 · 范围热点 + 关注词</span></div>
+              <div class="last-scan"><span>上次扫描</span><strong id="last-scan">尚未扫描</strong></div>
+            </section>
+          </aside>
+        </div>
+
+        <section id="settings" class="settings-section">
+          <div class="settings-title"><div><div class="section-kicker">CONNECTIONS</div><h2>连接与设置</h2><p>所有凭据只保存在本机数据库中。</p></div><div class="settings-badges"><span id="smtp-status" class="status-pill status-off">SMTP 未配置</span><span class="local-badge"><span></span>本地运行</span></div></div>
+          <form id="settings-form" class="settings-grid">
+            <div class="setting-block setting-scope"><div class="setting-heading"><span class="setting-index">01</span><div><h3>热点范围</h3><p>自动发现这个领域的新动态</p></div></div><label for="scope-input">监控主题</label><input id="scope-input" type="text" value="AI 编程" maxlength="120"><label for="interval-input">自动扫描间隔</label><div class="input-suffix"><input id="interval-input" type="number" min="5" max="1440" value="30"><span>分钟</span></div></div>
+            <div class="setting-block setting-ai"><div class="setting-heading"><span class="setting-index">02</span><div><h3>AI 真实性核验</h3><p>OpenRouter 结构化核验，也兼容 Ollama</p></div></div><label for="ai-url">API Base URL</label><input id="ai-url" type="url" placeholder="https://openrouter.ai/api/v1"><label for="ai-model">模型名称</label><input id="ai-model" type="text" placeholder="deepseek/deepseek-v4.1-flash"><label for="ai-key">OpenRouter API Key</label><input id="ai-key" type="password" placeholder="留空则保留已保存的密钥" autocomplete="new-password"></div>
+            <div class="setting-block setting-source"><div class="setting-heading"><span class="setting-index">03</span><div><h3>X 实时来源</h3><p>TwitterAPI.io 高级搜索</p></div></div><label for="twitter-key">TwitterAPI.io API Key</label><input id="twitter-key" type="password" placeholder="留空则保留已保存的 Key" autocomplete="new-password"><div class="connection-status"><span id="twitter-status" class="status-pill status-off">未配置</span><span>新账号按低频节奏轮询</span></div></div>
+            <div class="setting-block setting-alert"><div class="setting-heading"><span class="setting-index">04</span><div><h3>实时提醒与邮件</h3><p>浏览器打开时即时推送；紧急与高优先级热点发送邮件/实时提醒</p></div></div><div class="notification-actions"><button class="button button-secondary test-button" id="enable-browser-notifications" type="button">启用浏览器通知</button><span id="realtime-status" class="status-pill status-off">实时连接中</span></div><label for="smtp-host">SMTP 主机</label><input id="smtp-host" type="text" placeholder="smtp.example.com"><label for="smtp-port">SMTP 端口</label><input id="smtp-port" type="number" min="1" max="65535" value="587"><label for="smtp-security">加密方式</label><select id="smtp-security"><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">不加密</option></select><label for="smtp-username">SMTP 用户名</label><input id="smtp-username" type="text" autocomplete="username"><label for="smtp-password">SMTP 密码</label><input id="smtp-password" type="password" placeholder="留空则保留已保存的密码" autocomplete="new-password"><label for="smtp-sender">发件人邮箱</label><input id="smtp-sender" type="email" placeholder="leo@example.com"><label for="smtp-recipient">收件人邮箱</label><input id="smtp-recipient" type="email" placeholder="leo@example.com"><button class="button button-secondary test-button" id="test-email" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="m4 7 8 6 8-6"/></svg>发送测试邮件</button><details class="legacy-notification"><summary>可选：Telegram 兼容通道</summary><label for="telegram-token">Bot Token</label><input id="telegram-token" type="password" placeholder="留空则保留已保存的 Token" autocomplete="new-password"><label for="telegram-chat">Chat ID</label><input id="telegram-chat" type="text" placeholder="Telegram Chat ID"></details></div>
+            <div class="settings-actions"><span id="settings-feedback" role="status"></span><button class="button button-primary" type="submit">保存设置 <span aria-hidden="true">→</span></button></div>
+          </form>
+        </section>
+        <footer class="page-footer"><span>热探 Signal Desk <span class="footer-dot">·</span> Leo 的个人情报工作台</span><span>来源可追溯，判断留有余地。</span></footer>
+      </div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
