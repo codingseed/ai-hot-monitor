@@ -69,6 +69,8 @@ SCAN_LOCK = threading.Lock()
 SCAN_STATE: dict[str, Any] = {"running": False, "error": None, "last_started": None}
 WS_CLIENTS: set[ServerConnection] = set()
 WS_LOOP: asyncio.AbstractEventLoop | None = None
+TWITTER_REQUEST_LOCK = threading.Lock()
+TWITTER_LAST_REQUEST = 0.0
 
 
 class TextExtractor(HTMLParser):
@@ -78,6 +80,38 @@ class TextExtractor(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+
+class DuckDuckGoResultParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self.current: dict[str, str] | None = None
+        self.capture = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if "result__a" in classes:
+            self._finish()
+            self.current = {"title": "", "url": attributes.get("href") or "", "summary": ""}
+            self.capture = "title"
+        elif "result__snippet" in classes and self.current is not None:
+            self.capture = "summary"
+
+    def handle_data(self, data: str) -> None:
+        if self.current is not None and self.capture:
+            self.current[self.capture] += data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.capture == "title":
+            self.capture = ""
+
+    def _finish(self) -> None:
+        if self.current and self.current["title"].strip() and self.current["url"].strip():
+            self.results.append({key: value.strip() for key, value in self.current.items()})
+        self.current = None
+        self.capture = ""
 
 
 def clean_html(value: str) -> str:
@@ -90,7 +124,7 @@ def normalize_title(title: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", title.casefold())[:240]
 
 
-def parse_feed(payload: bytes) -> list[dict[str, str]]:
+def parse_feed(payload: bytes, platform: str = "Google News") -> list[dict[str, Any]]:
     root = ET.fromstring(payload)
     results = []
     for item in root.findall(".//item"):
@@ -99,28 +133,98 @@ def parse_feed(payload: bytes) -> list[dict[str, str]]:
         if not title or not link:
             continue
         source = item.find("source")
-        publisher = clean_html(source.text or "") if source is not None else "Google News"
+        publisher = clean_html(source.text or "") if source is not None else (urllib.parse.urlparse(link).hostname or platform)
         results.append({
             "title": title,
             "url": link,
             "summary": clean_html(item.findtext("description", ""))[:1600],
             "source": publisher,
             "publisher": publisher,
-            "source_url": source.attrib.get("url", "") if source is not None else "",
+            "source_url": source.attrib.get("url", "") if source is not None else link,
             "published_at": item.findtext("pubDate", ""),
-            "platform": "Google News",
+            "platform": platform,
         })
     return results
 
 
-def parse_twitter_search(payload: dict[str, Any]) -> list[dict[str, str]]:
+def parse_duckduckgo_search(payload: str, region: str = "global") -> list[dict[str, Any]]:
+    parser = DuckDuckGoResultParser()
+    parser.feed(payload)
+    parser.close()
+    parser._finish()
+    results = []
+    seen_urls = set()
+    for item in parser.results:
+        url = html.unescape(item["url"])
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname in {"duckduckgo.com", "www.duckduckgo.com"} and parsed.path in {"/l/", "/l"}:
+            url = urllib.parse.parse_qs(parsed.query).get("uddg", [url])[0]
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        publisher = parsed.hostname.removeprefix("www.")
+        results.append({
+            "title": clean_html(item["title"]), "summary": clean_html(item["summary"])[:1600],
+            "url": url, "source": publisher, "publisher": publisher, "source_url": url,
+            "published_at": "", "platform": "DuckDuckGo", "region": region,
+            "language": "zh" if region == "china" else "en",
+        })
+    return results
+
+
+def parse_hacker_news_search(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    results = []
+    for item in payload.get("hits", []):
+        if not isinstance(item, dict) or not item.get("objectID") or not item.get("title"):
+            continue
+        url = str(item.get("url") or f"https://news.ycombinator.com/item?id={item['objectID']}").strip()
+        if urllib.parse.urlparse(url).scheme not in {"http", "https"}:
+            continue
+        publisher = urllib.parse.urlparse(url).hostname or "Hacker News"
+        results.append({
+            "title": clean_html(str(item["title"])),
+            "summary": clean_html(str(item.get("story_text") or ""))[:1600],
+            "url": url, "source": f"Hacker News · {item.get('author', 'unknown')}",
+            "publisher": publisher.removeprefix("www."), "source_url": url,
+            "published_at": str(item.get("created_at", "")), "platform": "Hacker News",
+            "external_id": str(item["objectID"]), "region": "global", "language": "en",
+        })
+    return results
+
+
+def _nonnegative_count(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def parse_twitter_search(payload: dict[str, Any]) -> list[dict[str, Any]]:
     results = []
     for item in payload.get("tweets", []):
+        if not isinstance(item, dict):
+            continue
         text = str(item.get("text", "")).strip()
         external_id = str(item.get("id", "")).strip()
         if not text or not external_id:
             continue
         author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        likes = _nonnegative_count(item.get("likeCount"))
+        retweets = _nonnegative_count(item.get("retweetCount"))
+        views = _nonnegative_count(item.get("viewCount"))
+        followers = _nonnegative_count(author.get("followers"))
+        if item.get("isReply") is True or str(item.get("inReplyToId", "")).strip():
+            content_type = "reply"
+        elif item.get("retweeted_tweet") or item.get("retweetedTweet") or item.get("isRetweet"):
+            content_type = "retweet"
+        elif item.get("quoted_tweet") or item.get("quotedTweet") or item.get("isQuote"):
+            content_type = "quote"
+        else:
+            content_type = "original"
         username = str(author.get("userName", "")).strip()
         url = str(item.get("url", "")).strip()
         if not url:
@@ -138,8 +242,60 @@ def parse_twitter_search(payload: dict[str, Any]) -> list[dict[str, str]]:
             "publisher": username,
             "region": "global",
             "language": str(item.get("lang", "")),
+            "like_count": likes,
+            "retweet_count": retweets,
+            "reply_count": _nonnegative_count(item.get("replyCount")),
+            "view_count": views,
+            "author_followers": followers,
+            "author_verified": bool(author.get("isBlueVerified")),
+            "content_type": content_type,
         })
     return results
+
+
+def is_x_source(source: dict[str, Any]) -> bool:
+    hostname = urllib.parse.urlparse(str(source.get("url", ""))).hostname or ""
+    return source.get("platform") == "twitterapi.io" or hostname.casefold().removeprefix("www.") in {
+        "x.com", "twitter.com",
+    }
+
+
+def twitter_source_is_eligible(source: dict[str, Any]) -> bool:
+    if not is_x_source(source) or source.get("content_type") != "original":
+        return False
+    counts = (
+        _nonnegative_count(source.get("like_count")),
+        _nonnegative_count(source.get("retweet_count")),
+        _nonnegative_count(source.get("view_count")),
+        _nonnegative_count(source.get("author_followers")),
+    )
+    return all(count is not None for count in counts) and counts[0] >= 10 and counts[1] >= 5 and counts[2] >= 500 and counts[3] >= 100
+
+
+def parse_account_identifier(value: str) -> tuple[str, str, str] | None:
+    value = value.strip()
+    handle_match = re.fullmatch(r"@([A-Za-z0-9_]{1,15})", value)
+    if handle_match:
+        return "x", "username", handle_match.group(1)
+    x_uid_match = re.fullmatch(r"(?:x|twitter):([0-9]{5,})", value, re.IGNORECASE)
+    if x_uid_match:
+        return "x", "user_id", x_uid_match.group(1)
+    if re.fullmatch(r"[0-9]{8,}", value):
+        return "x", "user_id", value
+
+    parsed = urllib.parse.urlparse(value if "://" in value else f"https://{value}")
+    hostname = (parsed.hostname or "").casefold().removeprefix("www.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if hostname in {"x.com", "twitter.com"} and len(parts) == 1:
+        if parts[0].casefold() not in {"home", "search", "explore", "notifications", "messages", "settings", "i"}:
+            return "x", "username", parts[0].lstrip("@")
+    if hostname == "space.bilibili.com" and parts and parts[0].isdigit():
+        return "bilibili", "user_id", parts[0]
+    if hostname in {"weibo.com", "www.weibo.com"} and parts:
+        user_id = parts[1] if parts[0] == "u" and len(parts) > 1 else parts[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]+", user_id):
+            return "weibo", "user_id", user_id
+    return None
 
 
 @contextmanager
@@ -168,7 +324,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phrase TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS stories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +341,8 @@ def init_db() -> None:
                 relevance_score INTEGER NOT NULL DEFAULT 0,
                 urgency TEXT NOT NULL DEFAULT 'medium',
                 summary_zh TEXT NOT NULL DEFAULT '',
+                translation TEXT NOT NULL DEFAULT '',
+                translation_language TEXT NOT NULL DEFAULT '',
                 rationale TEXT NOT NULL DEFAULT '',
                 corroborations INTEGER NOT NULL DEFAULT 1,
                 discovered_at TEXT NOT NULL,
@@ -211,6 +370,13 @@ def init_db() -> None:
                 url TEXT NOT NULL,
                 published_at TEXT NOT NULL DEFAULT '',
                 discovered_at TEXT NOT NULL,
+                like_count INTEGER,
+                retweet_count INTEGER,
+                reply_count INTEGER,
+                view_count INTEGER,
+                author_followers INTEGER,
+                author_verified INTEGER NOT NULL DEFAULT 0,
+                content_type TEXT NOT NULL DEFAULT '',
                 UNIQUE(platform, external_id)
             );
             CREATE TABLE IF NOT EXISTS query_translations (
@@ -226,16 +392,31 @@ def init_db() -> None:
             ("relevance_score", "INTEGER NOT NULL DEFAULT 0"),
             ("urgency", "TEXT NOT NULL DEFAULT 'medium'"),
             ("summary_zh", "TEXT NOT NULL DEFAULT ''"),
+            ("translation", "TEXT NOT NULL DEFAULT ''"),
+            ("translation_language", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in story_columns:
                 db.execute(f"ALTER TABLE stories ADD COLUMN {column} {declaration}")
+        keyword_columns = {row["name"] for row in db.execute("PRAGMA table_info(keywords)")}
+        if "enabled" not in keyword_columns:
+            db.execute("ALTER TABLE keywords ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
         db.execute("""INSERT OR IGNORE INTO story_sources
             (story_id,platform,external_id,publisher,title,summary,url,published_at,discovered_at)
             SELECT id,'legacy','legacy:' || id,source,title,summary,url,published_at,discovered_at FROM stories""")
         source_columns = {row["name"] for row in db.execute("PRAGMA table_info(story_sources)")}
-        for column in ("region", "language"):
+        for column, declaration in (
+            ("region", "TEXT NOT NULL DEFAULT ''"),
+            ("language", "TEXT NOT NULL DEFAULT ''"),
+            ("like_count", "INTEGER"),
+            ("retweet_count", "INTEGER"),
+            ("reply_count", "INTEGER"),
+            ("view_count", "INTEGER"),
+            ("author_followers", "INTEGER"),
+            ("author_verified", "INTEGER NOT NULL DEFAULT 0"),
+            ("content_type", "TEXT NOT NULL DEFAULT ''"),
+        ):
             if column not in source_columns:
-                db.execute(f"ALTER TABLE story_sources ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                db.execute(f"ALTER TABLE story_sources ADD COLUMN {column} {declaration}")
 
 
 def get_settings() -> dict[str, str]:
@@ -299,17 +480,122 @@ def fetch_feed(query: str, region: str = "china") -> list[dict[str, str]]:
     return stories
 
 
-def fetch_twitter_search(query: str, api_key: str) -> list[dict[str, str]]:
-    if not api_key:
-        return []
-    params = urllib.parse.urlencode({"query": query, "queryType": "Latest", "cursor": ""})
+def fetch_bing_search(query: str) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode({"q": query, "format": "rss", "count": 10})
     request = urllib.request.Request(
-        f"https://api.twitterapi.io/twitter/tweet/advanced_search?{params}",
-        headers={"X-API-Key": api_key, "User-Agent": "AIHotMonitor/1.0"},
+        f"https://www.bing.com/search?{params}",
+        headers={"User-Agent": "AIHotMonitor/1.0 (personal non-commercial RSS aggregator)"},
+    )
+    with urllib.request.urlopen(request, timeout=18) as response:
+        return parse_feed(response.read(2_000_000), "Bing RSS")
+
+
+def fetch_duckduckgo_search(query: str, region: str = "global") -> list[dict[str, Any]]:
+    locale = "cn-zh" if region == "china" else "us-en"
+    params = urllib.parse.urlencode({"q": query, "kl": locale})
+    request = urllib.request.Request(
+        f"https://duckduckgo.com/?{params}",
+        headers={"User-Agent": "AIHotMonitor/1.0 (personal topic monitor)", "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(request, timeout=18) as response:
+        payload = response.read(2_000_000).decode("utf-8", errors="replace")
+    return parse_duckduckgo_search(payload, region)
+
+
+def fetch_hacker_news_search(query: str) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode({"query": query, "tags": "story", "hitsPerPage": 20})
+    request = urllib.request.Request(
+        f"https://hn.algolia.com/api/v1/search_by_date?{params}",
+        headers={"User-Agent": "AIHotMonitor/1.0 (personal topic monitor)"},
     )
     with urllib.request.urlopen(request, timeout=18) as response:
         payload = json.loads(response.read(1_000_000))
-    return parse_twitter_search(payload)
+    return parse_hacker_news_search(payload)
+
+
+def _twitter_api_get(path: str, params: dict[str, str], api_key: str) -> dict[str, Any]:
+    global TWITTER_LAST_REQUEST
+    with TWITTER_REQUEST_LOCK:
+        delay = 5.0 - (time.monotonic() - TWITTER_LAST_REQUEST)
+        if TWITTER_LAST_REQUEST and delay > 0:
+            time.sleep(delay)
+        TWITTER_LAST_REQUEST = time.monotonic()
+        query = urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            f"https://api.twitterapi.io{path}?{query}",
+            headers={"X-API-Key": api_key, "User-Agent": "AIHotMonitor/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=18) as response:
+            payload = json.loads(response.read(1_000_000))
+    if not isinstance(payload, dict):
+        raise ValueError("TwitterAPI.io 返回了无效响应")
+    return payload
+
+
+def fetch_twitter_search(query: str, api_key: str) -> list[dict[str, Any]]:
+    if not api_key:
+        return []
+    results = []
+    seen_ids: set[str] = set()
+    for query_type in ("Top", "Latest"):
+        cursor = ""
+        for _ in range(2):
+            payload = _twitter_api_get("/twitter/tweet/advanced_search", {
+                "query": query, "queryType": query_type, "cursor": cursor,
+            }, api_key)
+            for source in parse_twitter_search(payload):
+                if source["external_id"] not in seen_ids:
+                    seen_ids.add(source["external_id"])
+                    results.append(source)
+            next_cursor = str(payload.get("next_cursor", ""))
+            if not payload.get("has_next_page") or not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+    return results
+
+
+def fetch_twitter_account(identifier_type: str, identifier: str, api_key: str) -> list[dict[str, Any]]:
+    if not api_key:
+        return []
+    profile: dict[str, Any] = {}
+    if identifier_type == "username":
+        payload = _twitter_api_get("/twitter/user/info", {"userName": identifier}, api_key)
+        profile = payload.get("data", payload)
+        if isinstance(profile, dict) and isinstance(profile.get("user"), dict):
+            profile = profile["user"]
+        if not isinstance(profile, dict):
+            profile = {}
+    user_id = str(profile.get("id") or profile.get("userId") or "")
+    user_param = {"userId": user_id} if user_id else {"userName": identifier}
+    results = []
+    cursor = ""
+    seen_ids: set[str] = set()
+    for _ in range(2):
+        payload = _twitter_api_get("/twitter/user/last_tweets", {
+            **user_param, "cursor": cursor, "includeReplies": "false",
+        }, api_key)
+        tweets = payload.get("tweets", [])
+        normalized_tweets = []
+        for item in tweets if isinstance(tweets, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            author = item.get("author") if isinstance(item.get("author"), dict) else {}
+            item["author"] = {
+                **{key: profile[key] for key in ("userName", "id", "followers", "isBlueVerified") if key in profile},
+                **author,
+            }
+            normalized_tweets.append(item)
+        for source in parse_twitter_search({"tweets": normalized_tweets}):
+            if source["external_id"] not in seen_ids:
+                source["source"] = f"X @{source['publisher']}" if source["publisher"] else "X"
+                seen_ids.add(source["external_id"])
+                results.append(source)
+        next_cursor = str(payload.get("next_cursor", ""))
+        if not payload.get("has_next_page") or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return results
 
 
 def translate_query_to_english(query: str, settings: dict[str, str]) -> str:
@@ -365,35 +651,74 @@ def translate_query_to_english(query: str, settings: dict[str, str]) -> str:
         return ""
 
 
+def translation_target_for_story(story: dict[str, Any]) -> str:
+    languages = {
+        str(source.get("language", "")).casefold().split("-")[0]
+        for source in story.get("sources", []) if source.get("language")
+    }
+    if languages & {"zh", "ja", "ko"}:
+        return "zh"
+    if languages & {"es", "fr", "pt", "de", "it", "ru", "ar", "hi", "th", "vi"}:
+        return "en"
+    text = " ".join((str(story.get("title", "")), str(story.get("summary", ""))))
+    if re.search(r"[\u3040-\u30ff\uac00-\ud7af]", text):
+        return "zh"
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh"
+    return "en"
+
+
 def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str, str]) -> dict[str, Any]:
+    translation_language = translation_target_for_story(story)
     base_url = settings.get("ai_base_url", "").rstrip("/")
     model = settings.get("ai_model", "").strip()
     if not base_url or not model:
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-            "summary_zh": "", "rationale": "未配置 AI 核验模型。"}
+            "summary_zh": "", "translation": "", "translation_language": translation_language,
+            "rationale": "未配置 AI 核验模型。"}
     if "openrouter.ai" in base_url and not settings.get("ai_api_key", "").strip():
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-            "summary_zh": "", "rationale": "未配置 OpenRouter API Key。"}
+            "summary_zh": "", "translation": "", "translation_language": translation_language,
+            "rationale": "未配置 OpenRouter API Key。"}
 
     evidence = story.get("sources", [])
     evidence_text = "\n".join(
-        f"- {source.get('publisher') or source.get('platform')}: {source.get('url', '')}"
+        f"- {source.get('publisher') or source.get('platform')}: {source.get('title', '')}；"
+        f"{source.get('summary', '')[:500]}；{source.get('url', '')}"
         for source in evidence
     )
+    target_name = "简体中文" if translation_language == "zh" else "英文"
     prompt = (
-        "你是热点分析助手。真实性判断、关键词相关性与紧急度是三个独立维度，不要用真实性代替紧急度。"
+        "你是个人热点筛选助手，优先保留对用户监控主题有直接价值的新消息。真实性、主题相关性和紧急度是三个独立维度。"
         "真实性谨慎识别冒充官方、旧闻翻炒、夸张标题和无来源消息，证据不足时返回 uncertain。"
-        "relevance_score 是与关注关键词的匹配度，范围0-100；urgency 根据时效影响选择 urgent/high/medium/low。"
-        "summary_zh 用简洁中文概括消息。只根据来源证据，不要把推测说成事实。\n"
-        f"标题：{story['title']}\n摘要：{story['summary']}\n发布源：{story['source']}\n"
+        "relevance_score 表示对监控主题的直接匹配和实际信息价值，范围0-100；只共享宽泛行业词、泛化教程、招聘广告、旧闻复述或无实质更新的内容应低于35。"
+        "不要因为出现 AI、模型或科技名词就判高相关。urgency 根据现实影响和时效选择 urgent/high/medium/low。"
+        f"summary_zh 用简洁中文概括；translation 将原文核心内容翻译为{target_name}，若原文已经是目标语言则返回空字符串。"
+        "只根据给定来源，不要把推测说成事实。\n"
+        f"监控主题/关键词：{story.get('matched_keyword', '')}\n标题：{story['title']}\n摘要：{story['summary']}\n发布源：{story['source']}\n"
         f"独立发布者数：{corroborations}\n链接域名：{urllib.parse.urlparse(story['url']).netloc}\n"
         f"来源证据：\n{evidence_text}"
     )
+    few_shot = [
+        {"role": "user", "content": "监控主题：Claude Code。标题：MacBook 新款屏幕亮度提升。摘要：苹果更新笔记本显示屏参数，与 Claude Code 无直接关系。"},
+        {"role": "assistant", "content": json.dumps({
+            "verdict": "uncertain", "confidence": 0.3, "relevance_score": 8, "urgency": "low",
+            "summary_zh": "苹果更新笔记本屏幕参数。", "rationale": "内容没有涉及 Claude Code 或其直接关联产品。",
+            "evidence_gaps": ["缺少与监控主题相关的事实"], "translation": "", "translation_language": "en",
+        }, ensure_ascii=False)},
+        {"role": "user", "content": "监控主题：OpenAI Codex 编程代理。标题：OpenAI 为 Codex 增加后台任务。摘要：官方更新说明 Codex 可在后台并行执行开发任务。"},
+        {"role": "assistant", "content": json.dumps({
+            "verdict": "uncertain", "confidence": 0.55, "relevance_score": 94, "urgency": "high",
+            "summary_zh": "Codex 新增后台并行任务能力。", "rationale": "官方产品更新与监控主题直接相关；真实性仍需按来源证据判断。",
+            "evidence_gaps": ["需核对官方更新原文"], "translation": "", "translation_language": "en",
+        }, ensure_ascii=False)},
+    ]
     body = json.dumps({
         "model": model,
         "temperature": 0.1,
         "messages": [
-            {"role": "system", "content": "你负责谨慎核验新闻来源与证据。缺乏证据时必须判为 uncertain。"},
+            {"role": "system", "content": "按示例校准主题匹配度。相关性低不等于内容虚假；缺乏证据时真实性必须判为 uncertain。"},
+            *few_shot,
             {"role": "user", "content": prompt},
         ],
         "response_format": {
@@ -409,10 +734,13 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
                         "relevance_score": {"type": "integer", "minimum": 0, "maximum": 100},
                         "urgency": {"type": "string", "enum": ["urgent", "high", "medium", "low"]},
                         "summary_zh": {"type": "string"},
+                        "translation": {"type": "string"},
+                        "translation_language": {"type": "string", "enum": ["zh", "en"]},
                         "rationale": {"type": "string"},
                         "evidence_gaps": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["verdict", "confidence", "relevance_score", "urgency", "summary_zh", "rationale", "evidence_gaps"],
+                    "required": ["verdict", "confidence", "relevance_score", "urgency", "summary_zh",
+                                 "translation", "translation_language", "rationale", "evidence_gaps"],
                     "additionalProperties": False,
                 },
             },
@@ -449,11 +777,14 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
             "relevance_score": relevance,
             "urgency": urgency,
             "summary_zh": str(result.get("summary_zh", ""))[:500],
+            "translation": str(result.get("translation", ""))[:1200],
+            "translation_language": translation_language,
             "rationale": str(result.get("rationale", "模型未提供理由"))[:240],
         }
     except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-                "summary_zh": "", "rationale": f"AI 核验不可用：{str(exc)[:120]}"}
+                "summary_zh": "", "translation": "", "translation_language": translation_language,
+                "rationale": f"AI 核验不可用：{str(exc)[:120]}"}
 
 
 def send_telegram(text: str, settings: dict[str, str]) -> bool:
@@ -554,6 +885,8 @@ def publish_websocket(payload: dict[str, Any]) -> int:
 
 
 def send_notifications(story: dict[str, Any], sources: list[dict[str, Any]], settings: dict[str, str]) -> bool:
+    if story.get("verdict") != "credible" or story.get("urgency") not in {"urgent", "high"}:
+        return False
     evidence = [{key: source.get(key, "") for key in ("publisher", "url", "published_at", "platform")} for source in sources]
     source_lines = "\n".join(f"- {item['publisher'] or item['platform']}: {item['url']}" for item in evidence)
     text = (
@@ -680,63 +1013,210 @@ def apply_verification_gate(assessment: dict[str, Any], sources: list[dict[str, 
     return result
 
 
+def wait_for_source(last_requests: dict[str, float], source: str, interval: float = 1.0) -> None:
+    elapsed = time.monotonic() - last_requests.get(source, 0.0)
+    if last_requests.get(source) and elapsed < interval:
+        time.sleep(interval - elapsed)
+    last_requests[source] = time.monotonic()
+
+
+def get_enabled_keywords() -> list[str]:
+    with connect_db() as db:
+        return [row["phrase"] for row in db.execute(
+            "SELECT phrase FROM keywords WHERE enabled=1 ORDER BY id",
+        )]
+
+
+def log_scan(message: str) -> None:
+    print(message, flush=True)
+
+
+def save_story_source(db: sqlite3.Connection, story_id: int, source: dict[str, Any], discovered_at: str) -> bool:
+    source_url = str(source.get("url", ""))
+    platform = str(source.get("platform", "unknown"))
+    external_id = str(source.get("external_id") or source.get("source_url") or source_url)
+    if not external_id:
+        external_id = hashlib.sha256(str(source.get("title", "")).encode()).hexdigest()
+    publisher = str(source.get("publisher") or source.get("source") or "")
+    source_fields = {
+        "region": str(source.get("region", "")),
+        "language": str(source.get("language", "")),
+        "publisher": publisher,
+        "publisher_domain": publisher_domain(source),
+        "title": str(source.get("title", "")),
+        "summary": str(source.get("summary", "")),
+        "url": source_url,
+        "published_at": str(source.get("published_at", "")),
+        "content_type": str(source.get("content_type", "")),
+    }
+    previous = db.execute("""SELECT region,language,publisher,publisher_domain,title,summary,url,published_at,content_type
+        FROM story_sources WHERE platform=? AND external_id=?""", (platform, external_id)).fetchone()
+    assessment_changed = previous is None or any(
+        value and previous[key] != value for key, value in source_fields.items()
+    )
+    cursor = db.execute("""INSERT INTO story_sources
+        (story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at,discovered_at,
+         like_count,retweet_count,reply_count,view_count,author_followers,author_verified,content_type)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(platform,external_id) DO UPDATE SET
+            region=COALESCE(NULLIF(excluded.region,''),story_sources.region),
+            language=COALESCE(NULLIF(excluded.language,''),story_sources.language),
+            publisher=COALESCE(NULLIF(excluded.publisher,''),story_sources.publisher),
+            publisher_domain=COALESCE(NULLIF(excluded.publisher_domain,''),story_sources.publisher_domain),
+            title=COALESCE(NULLIF(excluded.title,''),story_sources.title),
+            summary=COALESCE(NULLIF(excluded.summary,''),story_sources.summary),
+            url=COALESCE(NULLIF(excluded.url,''),story_sources.url),
+            published_at=COALESCE(NULLIF(excluded.published_at,''),story_sources.published_at),
+            like_count=COALESCE(excluded.like_count,story_sources.like_count),
+            retweet_count=COALESCE(excluded.retweet_count,story_sources.retweet_count),
+            reply_count=COALESCE(excluded.reply_count,story_sources.reply_count),
+            view_count=COALESCE(excluded.view_count,story_sources.view_count),
+            author_followers=COALESCE(excluded.author_followers,story_sources.author_followers),
+            author_verified=MAX(excluded.author_verified,story_sources.author_verified),
+            content_type=COALESCE(NULLIF(excluded.content_type,''),story_sources.content_type)
+        WHERE (excluded.region<>'' AND story_sources.region IS NOT excluded.region)
+           OR (excluded.language<>'' AND story_sources.language IS NOT excluded.language)
+           OR (excluded.publisher<>'' AND story_sources.publisher IS NOT excluded.publisher)
+           OR (excluded.publisher_domain<>'' AND story_sources.publisher_domain IS NOT excluded.publisher_domain)
+           OR (excluded.title<>'' AND story_sources.title IS NOT excluded.title)
+           OR (excluded.summary<>'' AND story_sources.summary IS NOT excluded.summary)
+           OR (excluded.url<>'' AND story_sources.url IS NOT excluded.url)
+           OR (excluded.published_at<>'' AND story_sources.published_at IS NOT excluded.published_at)
+           OR (excluded.like_count IS NOT NULL AND story_sources.like_count IS NOT excluded.like_count)
+           OR (excluded.retweet_count IS NOT NULL AND story_sources.retweet_count IS NOT excluded.retweet_count)
+           OR (excluded.reply_count IS NOT NULL AND story_sources.reply_count IS NOT excluded.reply_count)
+           OR (excluded.view_count IS NOT NULL AND story_sources.view_count IS NOT excluded.view_count)
+           OR (excluded.author_followers IS NOT NULL AND story_sources.author_followers IS NOT excluded.author_followers)
+           OR (excluded.author_verified=1 AND story_sources.author_verified=0)
+           OR (excluded.content_type<>'' AND story_sources.content_type IS NOT excluded.content_type)""", (
+        story_id, platform, external_id, str(source.get("region", "")), str(source.get("language", "")),
+        publisher, source_fields["publisher_domain"], source_fields["title"], source_fields["summary"],
+        source_url, str(source.get("published_at", "")), discovered_at, source.get("like_count"),
+        source.get("retweet_count"), source.get("reply_count"), source.get("view_count"),
+        source.get("author_followers"), int(bool(source.get("author_verified"))),
+        str(source.get("content_type", "")),
+    ))
+    return assessment_changed
+
+
 def run_scan() -> None:
     started = datetime.now(timezone.utc).isoformat()
     SCAN_STATE.update(running=True, error=None, last_started=started)
     settings = get_settings()
-    scope = settings.get("scope", DEFAULTS["scope"])
-    with connect_db() as db:
-        keywords = [row["phrase"] for row in db.execute("SELECT phrase FROM keywords ORDER BY id")]
-    queries = list(dict.fromkeys([*keywords, scope]))
+    queries = list(dict.fromkeys(get_enabled_keywords()))
+    scope = ", ".join(queries) or "manual"
     items: list[dict[str, Any]] = []
     errors = []
     translation_warning = False
-    last_twitter_request = 0.0
+    last_source_requests: dict[str, float] = {}
+    hacker_news_queries: set[str] = set()
     twitter_key = settings.get("twitter_api_key", "")
+    source_counts = {
+        "Google News RSS": 0,
+        "Bing RSS": 0,
+        "DuckDuckGo": 0,
+        "Hacker News": 0,
+        "Twitter": 0,
+    }
+    twitter_eligible_count = 0
+    log_scan(f"\n[scan] Starting with {len(queries)} enabled keyword(s): {', '.join(queries) or '(none)'}")
 
     for query in queries:
+        account_identifier = parse_account_identifier(query)
+        if account_identifier and account_identifier[0] != "x":
+            platform = "Bilibili" if account_identifier[0] == "bilibili" else "微博"
+            message = f"{platform}账号直查尚未启用；当前未验证到合规可用的公开接口"
+            errors.append(message)
+            log_scan(f"[skip] {query}: {message}")
+            continue
         english_query = translate_query_to_english(query, settings)
         if re.search(r"[\u4e00-\u9fff]", query) and not english_query:
             translation_warning = True
         for region, regional_query in (("china", query), ("global", english_query or query)):
-            try:
-                for source in fetch_feed(regional_query, region):
-                    source["matched_keyword"] = query
-                    items.append({**source, "sources": [source]})
-            except (OSError, ET.ParseError, urllib.error.URLError) as exc:
-                errors.append(f"{region} RSS / {query}: {str(exc)[:100]}")
+            providers = (
+                ("Google News RSS", lambda: fetch_feed(regional_query, region)),
+                ("Bing RSS", lambda: fetch_bing_search(regional_query)),
+                ("DuckDuckGo", lambda: fetch_duckduckgo_search(regional_query, region)),
+            )
+            for provider, fetch in providers:
+                wait_for_source(last_source_requests, provider)
+                try:
+                    results = fetch()
+                    source_counts[provider] += len(results)
+                    log_scan(f'{provider} search for "{regional_query}" ({region}): found {len(results)} results')
+                    for source in results:
+                        source["matched_keyword"] = query
+                        items.append({**source, "sources": [source]})
+                except (OSError, ValueError, ET.ParseError, urllib.error.URLError) as exc:
+                    message = f"{provider} / {query}: {str(exc)[:100]}"
+                    errors.append(message)
+                    log_scan(f"[error] {message}")
 
-        if twitter_key:
-            twitter_query = f"{query} OR {english_query}" if english_query else query
-            delay = 5.0 - (time.monotonic() - last_twitter_request)
-            if last_twitter_request and delay > 0:
-                time.sleep(delay)
+        hn_query = english_query or (query if not re.search(r"[\u4e00-\u9fff]", query) else "")
+        if hn_query and hn_query not in hacker_news_queries:
+            wait_for_source(last_source_requests, "Hacker News", 0.5)
             try:
-                for source in fetch_twitter_search(twitter_query, twitter_key):
+                hn_results = fetch_hacker_news_search(hn_query)
+                source_counts["Hacker News"] += len(hn_results)
+                log_scan(f'Hacker News search for "{hn_query}": found {len(hn_results)} results')
+                for source in hn_results:
                     source["matched_keyword"] = query
                     items.append({**source, "sources": [source]})
             except (OSError, ValueError, urllib.error.URLError) as exc:
-                errors.append(f"X / {query}: {str(exc)[:100]}")
-            last_twitter_request = time.monotonic()
+                message = f"Hacker News / {query}: {str(exc)[:100]}"
+                errors.append(message)
+                log_scan(f"[error] {message}")
+            hacker_news_queries.add(hn_query)
+
+        if twitter_key:
+            twitter_query = f"{query} OR {english_query}" if english_query else query
+            try:
+                if account_identifier:
+                    x_sources = fetch_twitter_account(account_identifier[1], account_identifier[2], twitter_key)
+                else:
+                    x_sources = fetch_twitter_search(twitter_query, twitter_key)
+                source_counts["Twitter"] += len(x_sources)
+                eligible_count = sum(twitter_source_is_eligible(source) for source in x_sources)
+                twitter_eligible_count += eligible_count
+                log_scan(
+                    f'Twitter: {len(x_sources)} unique posts for "{query}" -> {eligible_count} quality-eligible '
+                    "(original posts; likes>=10, retweets>=5, views>=500, followers>=100)"
+                )
+                for source in x_sources:
+                    source["matched_keyword"] = query
+                    items.append({**source, "sources": [source]})
+            except (OSError, ValueError, urllib.error.URLError) as exc:
+                message = f"X / {query}: {str(exc)[:100]}"
+                errors.append(message)
+                log_scan(f"[error] {message}")
 
     if not twitter_key:
-        errors.append("TwitterAPI.io 未配置；本次跳过 X 搜索")
+        message = "TwitterAPI.io 未配置；本次跳过 X 搜索"
+        errors.append(message)
+        log_scan(f"[skip] {message}")
     if translation_warning:
-        errors.append("部分中文查询未能生成英文检索词，国际覆盖使用原词搜索")
+        message = "部分中文查询未能生成英文检索词，国际覆盖使用原词搜索"
+        errors.append(message)
+        log_scan(f"[warning] {message}")
 
     clusters = cluster_stories(items)
+    log_scan(f"[results] {len(items)} raw -> {len(clusters)} title clusters; X quality-eligible: {twitter_eligible_count}")
     found_count = 0
+    existing_count = 0
     for story in clusters:
         normalized = normalize_title(story["title"])
         if not normalized:
             continue
         fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc).isoformat()
+        is_new_story = False
         with connect_db() as db:
-            existing = db.execute("SELECT id,notified FROM stories WHERE fingerprint=?", (fingerprint,)).fetchone()
+            existing = db.execute("""SELECT id,notified,verdict,confidence,relevance_score,urgency,summary_zh,
+                translation,translation_language,rationale FROM stories WHERE fingerprint=?""", (fingerprint,)).fetchone()
             if existing:
                 story_id = existing["id"]
                 was_notified = bool(existing["notified"])
+                existing_count += 1
             else:
                 db.execute("""INSERT OR IGNORE INTO stories
                     (fingerprint,title,summary,url,source,published_at,matched_keyword,verdict,confidence,relevance_score,urgency,summary_zh,rationale,corroborations,discovered_at,notified)
@@ -748,40 +1228,50 @@ def run_scan() -> None:
                 story_id = saved_story["id"]
                 was_notified = bool(saved_story["notified"])
                 found_count += 1
+                is_new_story = True
 
+            source_changed = False
             for source in story["sources"]:
-                source_url = str(source.get("url", ""))
-                platform = str(source.get("platform", "unknown"))
-                external_id = str(source.get("external_id") or source.get("source_url") or source_url)
-                if not external_id:
-                    external_id = hashlib.sha256(str(source.get("title", "")).encode()).hexdigest()
-                publisher = str(source.get("publisher") or source.get("source") or "")
-                db.execute("""INSERT OR IGNORE INTO story_sources
-                    (story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at,discovered_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                    story_id, platform, external_id, str(source.get("region", "")), str(source.get("language", "")),
-                    publisher, publisher_domain(source),
-                    str(source.get("title", story["title"])), str(source.get("summary", "")), source_url,
-                    str(source.get("published_at", "")), now,
-                ))
+                source_changed = save_story_source(db, story_id, source, now) or source_changed
             evidence = [dict(row) for row in db.execute(
-                "SELECT platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at FROM story_sources WHERE story_id=?",
+                "SELECT platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at, "
+                "like_count,retweet_count,reply_count,view_count,author_followers,author_verified,content_type "
+                "FROM story_sources WHERE story_id=?",
                 (story_id,),
             )]
 
         corroborations, official = verification_evidence(evidence)
         story["sources"] = evidence
-        assessment = assess_story(story, corroborations, settings)
+        if existing and not source_changed:
+            assessment = {key: existing[key] for key in (
+                "verdict", "confidence", "relevance_score", "urgency", "summary_zh",
+                "translation", "translation_language", "rationale",
+            )}
+        else:
+            assessment = assess_story(story, corroborations, settings)
+        evidence = [source for source in evidence if not is_x_source(source) or twitter_source_is_eligible(source)]
+        corroborations, _ = verification_evidence(evidence)
         assessment = apply_verification_gate(assessment, evidence)
         story.update(assessment)
-        should_notify = assessment.get("urgency") in {"urgent", "high"} and not was_notified
+        should_notify = (
+            assessment.get("urgency") in {"urgent", "high"}
+            and assessment.get("verdict") == "credible"
+            and bool(evidence)
+            and not was_notified
+        )
         with connect_db() as db:
             db.execute("""UPDATE stories SET verdict=?,confidence=?,relevance_score=?,urgency=?,summary_zh=?,
-                rationale=?,corroborations=? WHERE id=?""", (
+                translation=?,translation_language=?,rationale=?,corroborations=? WHERE id=?""", (
                 assessment.get("verdict", "uncertain"), assessment.get("confidence", 0), assessment.get("relevance_score", 0),
-                assessment.get("urgency", "medium"), assessment.get("summary_zh", ""), assessment.get("rationale", ""),
+                assessment.get("urgency", "medium"), assessment.get("summary_zh", ""), assessment.get("translation", ""),
+                assessment.get("translation_language", ""), assessment.get("rationale", ""),
                 corroborations, story_id,
             ))
+        if is_new_story:
+            title = re.sub(r"\s+", " ", str(story.get("title", ""))).strip()
+            if len(title) > 160:
+                title = title[:157] + "..."
+            log_scan(f"[new hotspot] [{assessment.get('urgency', 'medium')}] {title} ({assessment.get('verdict', 'uncertain')})")
         if should_notify:
             notified = int(send_notifications(story, evidence, settings))
             if notified:
@@ -794,6 +1284,11 @@ def run_scan() -> None:
         db.execute("INSERT INTO scans(scope,started_at,finished_at,found_count,status) VALUES(?,?,?,?,?)",
                    (scope, started, finished, found_count, status))
     SCAN_STATE.update(running=False, error="; ".join(errors[:3]) if errors else None)
+    providers_summary = " | ".join(f"{provider}: {count}" for provider, count in source_counts.items())
+    log_scan(
+        f"[complete] Total: {len(items)} raw -> {len(clusters)} unique -> {found_count} new "
+        f"({existing_count} already stored); {status}. {providers_summary}"
+    )
 
 
 def start_scan() -> bool:
@@ -805,51 +1300,91 @@ def start_scan() -> bool:
             run_scan()
         except Exception as exc:
             SCAN_STATE.update(running=False, error=str(exc)[:240])
+            log_scan(f"[scan error] {str(exc)[:240]}")
         finally:
             SCAN_LOCK.release()
+            publish_websocket({"type": "scan_completed"})
 
     threading.Thread(target=worker, daemon=True, name="hot-monitor-scan").start()
     return True
 
 
-def scheduler() -> None:
-    while True:
-        try:
-            interval = max(5, int(get_settings().get("interval_minutes", "30"))) * 60
-            with connect_db() as db:
-                last = db.execute("SELECT finished_at FROM scans ORDER BY id DESC LIMIT 1").fetchone()
-            elapsed = interval if not last else time.time() - datetime.fromisoformat(last["finished_at"]).timestamp()
-            if elapsed >= interval and not SCAN_STATE["running"]:
-                start_scan()
-        except Exception as exc:
-            SCAN_STATE.update(error=str(exc)[:240])
-        time.sleep(20)
-
-
-def dashboard_state() -> dict[str, Any]:
+def dashboard_state(limit: int = 500) -> dict[str, Any]:
+    limit = max(1, min(500, int(limit)))
     settings = get_settings()
     with connect_db() as db:
-        keywords = [dict(row) for row in db.execute("SELECT id,phrase,created_at FROM keywords ORDER BY id DESC")]
-        stories = [dict(row) for row in db.execute("SELECT * FROM stories ORDER BY discovered_at DESC LIMIT 80")]
+        keywords = [dict(row) for row in db.execute("SELECT id,phrase,created_at,enabled FROM keywords ORDER BY id DESC")]
+        stories = [dict(row) for row in db.execute(
+            "SELECT * FROM stories ORDER BY discovered_at DESC LIMIT ?", (limit,),
+        )]
         story_ids = [story["id"] for story in stories]
         if story_ids:
             placeholders = ",".join("?" for _ in story_ids)
             source_rows = [dict(row) for row in db.execute(
-                f"SELECT story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at "
+                f"SELECT story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at,"
+                f"like_count,retweet_count,reply_count,view_count,author_followers,author_verified,content_type "
                 f"FROM story_sources WHERE story_id IN ({placeholders}) ORDER BY id",
                 story_ids,
             )]
         else:
             source_rows = []
         scans = [dict(row) for row in db.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 12")]
+        total_story_count = db.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
         totals = {row["verdict"]: row["count"] for row in db.execute("SELECT verdict,COUNT(*) AS count FROM stories GROUP BY verdict")}
         last_scan = db.execute("SELECT finished_at FROM scans ORDER BY id DESC LIMIT 1").fetchone()
     public_settings = {key: settings[key] for key in ("scope", "interval_minutes", "ai_base_url", "ai_model")}
     sources_by_story: dict[int, list[dict[str, Any]]] = {}
     for source in source_rows:
         sources_by_story.setdefault(source["story_id"], []).append(source)
+    visible_stories = []
     for story in stories:
-        story["sources"] = sources_by_story.get(story["id"], [])
+        all_sources = sources_by_story.get(story["id"], [])
+        current_source_urls = {
+            str(source.get("url", "")).rstrip("/")
+            for source in all_sources if source.get("platform") != "legacy" and source.get("url")
+        }
+        all_sources = [source for source in all_sources if not (
+            source.get("platform") == "legacy" and str(source.get("url", "")).rstrip("/") in current_source_urls
+        )]
+        for source in all_sources:
+            source["is_x_source"] = is_x_source(source)
+            source["quality_eligible"] = not source["is_x_source"] or twitter_source_is_eligible(source)
+            has_complete_metrics = all(source.get(field) is not None for field in (
+                "like_count", "retweet_count", "view_count", "author_followers",
+            )) and bool(source.get("content_type"))
+            source["quality_status"] = (
+                "not_applicable" if not source["is_x_source"] else
+                "unknown" if not has_complete_metrics else
+                "eligible" if source["quality_eligible"] else "ineligible"
+            )
+        eligible_sources = [source for source in all_sources if source["quality_eligible"]]
+        story["sources"] = all_sources
+        story["source_quality_warning"] = any(
+            source["quality_status"] == "ineligible" for source in all_sources
+        )
+        story["relevance_unavailable"] = str(story.get("rationale", "")).startswith((
+            "AI 核验不可用", "未配置 AI 核验", "未配置 OpenRouter API Key",
+        ))
+        primary_is_x = is_x_source({"url": story.get("url", ""), "platform": ""}) or str(
+            story.get("source", "")
+        ).casefold().startswith("x @")
+        has_eligible_primary = any(
+            is_x_source(source) and twitter_source_is_eligible(source)
+            and source.get("url") == story.get("url") for source in eligible_sources
+        )
+        if primary_is_x and not has_eligible_primary:
+            replacement = next((source for source in eligible_sources if not is_x_source(source)), None)
+            if replacement:
+                story.update({
+                    "title": replacement.get("title") or story.get("title", ""),
+                    "summary": replacement.get("summary") or "",
+                    "summary_zh": "",
+                    "url": replacement.get("url") or "",
+                    "source": replacement.get("publisher") or replacement.get("platform") or "未知来源",
+                    "published_at": replacement.get("published_at") or story.get("published_at", ""),
+                })
+        visible_stories.append(story)
+    stories = visible_stories
     public_settings.update({
         "ai_configured": bool(
             settings.get("ai_base_url") and settings.get("ai_model")
@@ -869,6 +1404,7 @@ def dashboard_state() -> dict[str, Any]:
         "telegram_configured": bool(settings.get("telegram_bot_token") and settings.get("telegram_chat_id")),
     })
     return {"keywords": keywords, "stories": stories, "scans": scans, "totals": totals,
+            "total_story_count": total_story_count,
             "last_scan": last_scan["finished_at"] if last_scan else None,
             "scan_state": dict(SCAN_STATE), "settings": public_settings}
 
@@ -893,9 +1429,15 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b"{}")
 
     def do_GET(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
         if path == "/api/state":
-            return self._json(200, dashboard_state())
+            requested_limit = urllib.parse.parse_qs(parsed_path.query).get("limit", ["500"])[0]
+            try:
+                limit = int(requested_limit)
+            except ValueError:
+                limit = 500
+            return self._json(200, dashboard_state(limit))
         if path == "/api/health":
             return self._json(200, {"ok": True})
         target = WEB_DIR / ("index.html" if path == "/" else path.lstrip("/"))
@@ -904,7 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
             if not target.is_relative_to(WEB_DIR.resolve()) or not target.is_file():
                 raise FileNotFoundError
             data = target.read_bytes()
-            content_type = "text/html; charset=utf-8" if target.suffix == ".html" else "text/css; charset=utf-8" if target.suffix == ".css" else "text/javascript; charset=utf-8" if target.suffix == ".js" else "application/octet-stream"
+            content_type = "text/html; charset=utf-8" if target.suffix == ".html" else "text/css; charset=utf-8" if target.suffix == ".css" else "text/javascript; charset=utf-8" if target.suffix == ".js" else "image/svg+xml" if target.suffix == ".svg" else "application/octet-stream"
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
@@ -925,6 +1467,8 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("INSERT OR IGNORE INTO keywords(phrase,created_at) VALUES(?,?)", (phrase, datetime.now(timezone.utc).isoformat()))
                 return self._json(201, dashboard_state())
             if path == "/api/scan":
+                if not get_enabled_keywords():
+                    return self._json(400, {"error": "请先启用至少一个监控词"})
                 if not start_scan():
                     return self._json(409, {"error": "扫描正在进行"})
                 return self._json(202, {"started": True})
@@ -963,10 +1507,26 @@ class Handler(BaseHTTPRequestHandler):
             db.execute("DELETE FROM keywords WHERE id=?", (int(match.group(1)),))
         self._json(200, dashboard_state())
 
+    def do_PATCH(self) -> None:
+        match = re.fullmatch(r"/api/keywords/(\d+)", urllib.parse.urlparse(self.path).path)
+        if not match:
+            return self._json(404, {"error": "接口不存在"})
+        try:
+            body = self._body()
+        except (json.JSONDecodeError, ValueError) as exc:
+            return self._json(400, {"error": f"请求格式无效：{str(exc)[:100]}"})
+        if not isinstance(body.get("enabled"), bool):
+            return self._json(400, {"error": "enabled 必须为布尔值"})
+        with connect_db() as db:
+            result = db.execute("UPDATE keywords SET enabled=? WHERE id=?",
+                                (int(body["enabled"]), int(match.group(1))))
+            if not result.rowcount:
+                return self._json(404, {"error": "监控词不存在"})
+        self._json(200, dashboard_state())
+
 
 def main() -> None:
     init_db()
-    threading.Thread(target=scheduler, daemon=True, name="hot-monitor-scheduler").start()
     start_websocket_server()
     host = os.environ.get("AI_HOT_MONITOR_HOST", "127.0.0.1")
     port = int(os.environ.get("AI_HOT_MONITOR_PORT", "8765"))
