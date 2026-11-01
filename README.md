@@ -82,16 +82,16 @@ py -3 app.py
 - **相关性与摘要**：AI 输出 0–100 相关性评分、独立相关性理由与中文摘要；理由可逐条展开，或一键展开/折叠全部。
 - **前端体验**：深色科技主题与克制动效（极光、光束、流星、Spotlight、打字机等），`prefers-reduced-motion` 下自动关闭。
 - **刷新策略**：移除 15 秒全量轮询，改为 30 秒轻量监听扫描完成后再刷新，WebSocket 即时推送 urgent/high，避免界面闪烁。
-- **更多信号与筛选**：状态 API 对全量记录筛选和排序后再分页，界面每次加载 30 条并可继续加载；支持按来源、紧急度、最低相关性筛选，以及按最新发布、最新发现、相关性、重要程度和热度综合排序。
+- **更多信号与筛选**：状态 API 对全量记录筛选和排序后再分页，界面每次加载 20 条并可继续加载；支持按来源、紧急度、最低相关性筛选，以及按最新发布、最新发现、相关性、重要程度和热度综合排序。
 - **来源就地预览**：每条热点直接显示最多 3 条来源标题、摘要摘录和时间，其余来源可展开；打开原文仍是可选操作。
-- **相关性 few-shot**：审核提示包含主题不匹配与直接相关的示例，要求真实性与相关性分开判断，并降低泛化/重复/无实质更新内容的分数。相关性 35+ 为默认筛选，未核验内容仍可见。
+- **相关性 few-shot**：审核提示包含主题不匹配与直接相关的示例，要求真实性与相关性分开判断，并降低泛化/重复/无实质更新内容的分数。相关性 55+ 为默认筛选，未核验内容仍可见。
 - **多语言译文**：审核结果增加译文；日语、韩语等非中英内容优先译为中文，西语/法语译为英文，译文在工作台内显示。
 
 ## Agent Skill
 
 将 [`skills/ai-hot-monitor/SKILL.md`](skills/ai-hot-monitor/SKILL.md) 提供给其他 AI。Skill 描述本地 API、国内外实时搜索、证据核验、结果报告和密钥安全要求。
 
-本地 API：`GET /api/state?page=1&pageSize=30&sort=recent&urgency=all&source=all&relevance=0`、`GET /api/health`、`POST /api/keywords`、`DELETE /api/keywords/{id}`、`POST /api/scan`、`POST /api/settings`、`POST /api/notifications/test-email`。`sort` 支持 `recent`、`discovered`、`relevance`、`importance`、`hot`。
+本地 API：`GET /api/state?page=1&pageSize=20&sort=recent&urgency=all&source=all&relevance=0`、`GET /api/health`、`POST /api/keywords`、`DELETE /api/keywords/{id}`、`POST /api/scan`、`POST /api/settings`、`POST /api/notifications/test-email`。`sort` 支持 `recent`、`discovered`、`relevance`、`importance`、`hot`。
 
 ## 测试
 
