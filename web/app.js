@@ -136,12 +136,10 @@ function renderKeywords(keywords) {
 
 function renderSourceOptions(stories) {
   const sourceFilter = $('#source-filter');
-  const selected = sourceFilter.value;
+  const selected = sourceFilter.value || new URLSearchParams(window.location.search).get('source') || 'all';
   const labels = new Map();
-  for (const story of stories) {
-    for (const source of story.sources || []) {
-      if (source.platform) labels.set(source.platform, source.platform === 'twitterapi.io' ? 'X' : source.platform);
-    }
+  for (const platform of stories) {
+    if (platform) labels.set(platform, platform === 'twitterapi.io' ? 'X' : platform === 'legacy' ? '历史记录' : platform);
   }
   sourceFilter.replaceChildren(new Option('全部来源', 'all'));
   for (const [value, label] of [...labels].sort((left, right) => left[1].localeCompare(right[1], 'zh-CN'))) {
@@ -151,8 +149,58 @@ function renderSourceOptions(stories) {
 }
 
 const urgencyLabels = { urgent: '紧急', high: '高', medium: '中', low: '低' };
-let visibleStoryLimit = 30;
-const storyPageSize = 30;
+const storyPageSize = 20;
+let allRelevanceReasonsExpanded = false;
+
+function updateRelevanceToggle() {
+  const details = [...document.querySelectorAll('.relevance-reason')];
+  const button = $('#relevance-toggle-all');
+  allRelevanceReasonsExpanded = details.length > 0 && details.every((item) => item.open);
+  button.textContent = allRelevanceReasonsExpanded ? '折叠已加载理由' : '展开已加载理由';
+  button.disabled = details.length === 0;
+}
+
+function feedStateUrl(page = 1) {
+  const source = $('#source-filter').value || new URLSearchParams(window.location.search).get('source') || 'all';
+  const params = new URLSearchParams({
+    sort: $('#sort-filter').value,
+    page: String(page),
+    pageSize: String(storyPageSize),
+    urgency: $('#story-filter').value,
+    source,
+    relevance: $('#relevance-filter').value,
+  });
+  return `/api/state?${params}`;
+}
+
+function syncFeedUrl() {
+  const url = new URL(window.location.href);
+  const defaults = { sort: 'recent', urgency: 'all', source: 'all', relevance: '0' };
+  const values = {
+    sort: $('#sort-filter').value,
+    urgency: $('#story-filter').value,
+    source: $('#source-filter').value || url.searchParams.get('source') || 'all',
+    relevance: $('#relevance-filter').value,
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value === defaults[key]) url.searchParams.delete(key);
+    else url.searchParams.set(key, value);
+  }
+  history.replaceState(null, '', url);
+}
+
+function restoreFeedFilters() {
+  const params = new URLSearchParams(window.location.search);
+  const allowed = {
+    sort: ['recent', 'discovered', 'relevance', 'importance', 'hot'],
+    urgency: ['all', 'urgent', 'high', 'medium', 'low'],
+    relevance: ['0', '35', '60', '80'],
+  };
+  if (allowed.sort.includes(params.get('sort'))) $('#sort-filter').value = params.get('sort');
+  if (allowed.urgency.includes(params.get('urgency'))) $('#story-filter').value = params.get('urgency');
+  if (allowed.relevance.includes(params.get('relevance'))) $('#relevance-filter').value = params.get('relevance');
+  if (params.get('source')) $('#source-filter').value = params.get('source');
+}
 
 function makeIcon(path) {
   const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -172,7 +220,7 @@ function formatMetric(value) {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(number);
 }
 
-function renderSourceEvidence(source) {
+function renderSourceEvidence(source, story) {
   const item = document.createElement('article');
   item.className = 'source-evidence';
   const header = document.createElement('div');
@@ -213,12 +261,24 @@ function renderSourceEvidence(source) {
     external.textContent = '查看来源';
     header.append(external);
   }
-  const title = document.createElement('p');
-  title.className = 'source-evidence-title';
-  title.textContent = source.title || '';
-  const excerpt = document.createElement('p');
-  excerpt.className = 'source-evidence-excerpt';
-  excerpt.textContent = source.summary || source.title || '来源未提供摘要';
+  const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+  const sourceTitle = normalizeText(source.title);
+  const storyTitle = normalizeText(story.title);
+  const sourceSummary = normalizeText(source.summary);
+  const storySummary = normalizeText(story.summary_zh || story.summary);
+  const content = [];
+  if (sourceTitle && sourceTitle !== storyTitle) {
+    const title = document.createElement('p');
+    title.className = 'source-evidence-title';
+    title.textContent = source.title;
+    content.push(title);
+  }
+  if (sourceSummary && sourceSummary !== storyTitle && sourceSummary !== storySummary && sourceSummary !== sourceTitle) {
+    const excerpt = document.createElement('p');
+    excerpt.className = 'source-evidence-excerpt';
+    excerpt.textContent = source.summary;
+    content.push(excerpt);
+  }
   const metrics = document.createElement('div');
   metrics.className = 'source-metrics';
   const metricFields = [
@@ -229,6 +289,7 @@ function renderSourceEvidence(source) {
     ['author_followers', '粉丝', 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m6-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm12 10v-2a4 4 0 0 0-3-3.9m-3-12.1a4 4 0 0 1 0 7.8'],
   ];
   for (const [field, label, iconPath] of metricFields) {
+    if (source[field] === null || source[field] === undefined || source[field] === '') continue;
     const metric = document.createElement('span');
     metric.className = 'source-metric';
     metric.title = label;
@@ -238,46 +299,33 @@ function renderSourceEvidence(source) {
     metric.append(value);
     metrics.append(metric);
   }
-  item.append(header, title, excerpt, metrics);
+  item.append(header, ...content);
+  if (metrics.childElementCount) item.append(metrics);
   return item;
 }
 
-function renderStories(stories) {
+function renderStories(stories, state = dashboard) {
   const list = $('#story-list');
-  const urgency = $('#story-filter').value;
-  const sourcePlatform = $('#source-filter').value;
-  const minimumRelevance = Number($('#relevance-filter').value || 0);
-  const aiConfigured = Boolean(dashboard?.settings?.ai_configured);
-  const filtered = stories.filter((story) => {
-    if (urgency !== 'all' && (story.urgency || 'medium') !== urgency) return false;
-    if (sourcePlatform !== 'all' && !(story.sources || []).some((source) => source.platform === sourcePlatform)) return false;
-    if (aiConfigured && story.verdict !== 'unverified' && Number(story.relevance_score || 0) < minimumRelevance) return false;
-    return true;
-  });
-  if ($('#sort-filter').value === 'relevance') {
-    filtered.sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0));
-  } else {
-    filtered.sort((left, right) => new Date(right.published_at || right.discovered_at || 0)
-      - new Date(left.published_at || left.discovered_at || 0));
-  }
-  const visible = filtered.slice(0, visibleStoryLimit);
+  const filteredCount = Number(state?.filtered_story_count ?? stories.length);
+  const totalCount = Number(state?.total_story_count ?? stories.length);
   list.replaceChildren();
-  $('#empty-state').hidden = stories.length > 0;
-  $('#load-more').hidden = filtered.length <= visible.length;
-  $('#load-more').textContent = `加载更多（剩余 ${Math.max(0, filtered.length - visible.length)} 条）`;
-  if (!stories.length) {
+  updateRelevanceToggle();
+  $('#empty-state').hidden = totalCount > 0;
+  $('#load-more').hidden = !state?.has_more;
+  $('#load-more').textContent = `加载更多（已载入 ${stories.length} / ${filteredCount} 条）`;
+  if (!totalCount) {
     setText('#feed-count', '暂无已收录信号');
     return;
   }
-  if (!filtered.length) {
+  if (!filteredCount) {
     const empty = document.createElement('div');
     empty.className = 'loading-state';
     empty.textContent = '当前筛选条件下暂无热点';
     list.append(empty);
-    setText('#feed-count', `共 ${stories.length} 条，当前条件下暂无结果`);
+    setText('#feed-count', `共 ${totalCount} 条，当前条件下暂无结果`);
     return;
   }
-  for (const story of visible) {
+  for (const story of stories) {
     const row = document.createElement('article');
     row.className = 'story-row spotlight';
     const main = document.createElement('div');
@@ -329,9 +377,15 @@ function renderStories(stories) {
     }
     const sourceList = document.createElement('div');
     sourceList.className = 'story-sources';
-    const sourceItems = story.sources || [];
+    const storyText = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+    const sourceItems = (story.sources || []).filter((evidence) => !(
+      storyText(evidence.publisher) === storyText(story.source)
+      && storyText(evidence.title) === storyText(story.title)
+      && storyText(evidence.summary) === storyText(story.summary)
+      && String(evidence.url || '').replace(/\/$/, '') === String(story.url || '').replace(/\/$/, '')
+    ));
     for (const evidence of sourceItems.slice(0, 3)) {
-      const item = renderSourceEvidence(evidence);
+      const item = renderSourceEvidence(evidence, story);
       if (item) sourceList.append(item);
     }
     if (sourceItems.length > 3) {
@@ -341,7 +395,7 @@ function renderStories(stories) {
       moreLabel.textContent = `展开其余 ${sourceItems.length - 3} 条来源`;
       moreSources.append(moreLabel);
       for (const evidence of sourceItems.slice(3)) {
-        const item = renderSourceEvidence(evidence);
+        const item = renderSourceEvidence(evidence, story);
         if (item) moreSources.append(item);
       }
       sourceList.append(moreSources);
@@ -365,12 +419,25 @@ function renderStories(stories) {
     relevance.append(makeIcon('M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 4v5l3 2'));
     relevance.append(document.createTextNode(story.relevance_unavailable
       ? '相关性暂不可用' : `主题相关性 ${Math.round(story.relevance_score || 0)}%`));
-    if (story.rationale) relevance.title = story.rationale;
     side.append(relevance);
+    const relevanceReason = document.createElement('details');
+    relevanceReason.className = 'relevance-reason';
+    relevanceReason.open = allRelevanceReasonsExpanded;
+    const relevanceReasonLabel = document.createElement('summary');
+    relevanceReasonLabel.textContent = 'AI 相关性理由';
+    const relevanceReasonText = document.createElement('p');
+    relevanceReasonText.textContent = story.relevance_rationale
+      || (story.relevance_unavailable
+        ? `AI 分析暂不可用：${story.rationale || '请求失败'}`
+        : '此记录尚无相关性理由；下次扫描命中后会生成。');
+    relevanceReason.append(relevanceReasonLabel, relevanceReasonText);
+    relevanceReason.addEventListener('toggle', updateRelevanceToggle);
+    main.append(relevanceReason);
     row.append(main, side);
     list.append(row);
   }
-  setText('#feed-count', `显示 ${visible.length} / ${filtered.length} 条 · 已载入 ${stories.length} 条`);
+  updateRelevanceToggle();
+  setText('#feed-count', `显示 ${stories.length} / ${filteredCount} 条`);
 }
 
 function updateSchedule(state) {
@@ -405,11 +472,13 @@ function updateSchedule(state) {
 function render(state) {
   dashboard = state;
   renderKeywords(state.keywords);
-  renderSourceOptions(state.stories);
-  renderStories(state.stories);
+  const sourceOptions = state.source_options || [...new Set(state.stories.flatMap((story) =>
+    (story.sources || []).map((source) => source.platform).filter(Boolean)))];
+  renderSourceOptions(sourceOptions);
+  renderStories(state.stories, state);
   const total = state.total_story_count ?? state.stories.length;
-  const urgent = state.stories.filter((story) => story.urgency === 'urgent').length;
-  const high = state.stories.filter((story) => story.urgency === 'high').length;
+  const urgent = state.urgency_totals?.urgent || 0;
+  const high = state.urgency_totals?.high || 0;
   setText('#metric-total', String(total).padStart(2, '0'));
   setText('#metric-urgent', String(urgent).padStart(2, '0'));
   setText('#metric-high', String(high).padStart(2, '0'));
@@ -430,19 +499,33 @@ function render(state) {
 let lastStoriesSignature = '';
 async function refresh() {
   try {
-    const state = await api('/api/state?limit=500');
-    const signature = JSON.stringify(state.stories.map((s) => [s.id, s.urgency, s.relevance_score, s.verdict,
-      s.summary_zh, s.translation, s.title, (s.sources || []).length]));
+    syncFeedUrl();
+    const state = await api(feedStateUrl());
+    const signature = JSON.stringify([
+      $('#sort-filter').value, $('#story-filter').value, $('#source-filter').value,
+      $('#relevance-filter').value, state.filtered_story_count, state.has_more, state.source_options,
+      state.stories.map((s) => [s.id, s.urgency, s.relevance_score, s.verdict,
+        s.summary_zh, s.translation, s.title, (s.sources || []).length]),
+    ]);
     const changed = signature !== lastStoriesSignature;
     lastStoriesSignature = signature;
     if (changed) render(state);
     else {
-      dashboard = state;
+      const previouslyLoaded = dashboard;
+      const loadedStories = previouslyLoaded?.page > 1
+        ? [...state.stories, ...previouslyLoaded.stories.slice(state.stories.length)].slice(0, state.filtered_story_count)
+        : state.stories;
+      dashboard = {
+        ...state,
+        stories: loadedStories,
+        page: Math.max(1, Math.ceil(loadedStories.length / state.page_size)),
+        has_more: loadedStories.length < state.filtered_story_count,
+      };
       renderKeywords(state.keywords);
       updateSchedule(state);
       setText('#metric-total', String(state.total_story_count ?? state.stories.length).padStart(2, '0'));
-      setText('#metric-urgent', String(state.stories.filter((s) => s.urgency === 'urgent').length).padStart(2, '0'));
-      setText('#metric-high', String(state.stories.filter((s) => s.urgency === 'high').length).padStart(2, '0'));
+      setText('#metric-urgent', String(state.urgency_totals?.urgent || 0).padStart(2, '0'));
+      setText('#metric-high', String(state.urgency_totals?.high || 0).padStart(2, '0'));
       setText('#metric-keywords', String(state.keywords.filter((keyword) => keyword.enabled).length));
     }
   } catch (error) {
@@ -457,9 +540,9 @@ $('#keyword-form').addEventListener('submit', async (event) => {
   const phrase = input.value.trim();
   if (!phrase) return;
   try {
-    const state = await api('/api/keywords', { method: 'POST', body: JSON.stringify({ phrase }) });
+    await api('/api/keywords', { method: 'POST', body: JSON.stringify({ phrase }) });
     input.value = '';
-    render(state);
+    await refresh();
     showToast(`开始追踪「${phrase}」`);
   } catch (error) {
     showToast(error.message, true);
@@ -478,15 +561,29 @@ $('#scan-button').addEventListener('click', async () => {
 });
 
 $('#refresh-button').addEventListener('click', refresh);
+$('#relevance-toggle-all').addEventListener('click', () => {
+  const details = [...document.querySelectorAll('.relevance-reason')];
+  const shouldExpand = !details.every((item) => item.open);
+  allRelevanceReasonsExpanded = shouldExpand;
+  details.forEach((item) => { item.open = shouldExpand; });
+  updateRelevanceToggle();
+});
+restoreFeedFilters();
 for (const selector of ['#story-filter', '#source-filter', '#relevance-filter', '#sort-filter']) {
-  $(selector).addEventListener('change', () => {
-    visibleStoryLimit = storyPageSize;
-    if (dashboard) renderStories(dashboard.stories);
-  });
+  $(selector).addEventListener('change', () => { refresh(); });
 }
-$('#load-more').addEventListener('click', () => {
-  visibleStoryLimit += storyPageSize;
-  if (dashboard) renderStories(dashboard.stories);
+$('#load-more').addEventListener('click', async () => {
+  if (!dashboard?.has_more || $('#load-more').disabled) return;
+  $('#load-more').disabled = true;
+  try {
+    const nextPage = await api(feedStateUrl(dashboard.page + 1));
+    dashboard = { ...dashboard, ...nextPage, stories: [...dashboard.stories, ...nextPage.stories] };
+    renderStories(dashboard.stories, dashboard);
+  } catch (error) {
+    showToast(`无法加载更多热点：${error.message}`, true);
+  } finally {
+    $('#load-more').disabled = false;
+  }
 });
 
 $('#settings-form').addEventListener('submit', async (event) => {
@@ -511,7 +608,8 @@ $('#settings-form').addEventListener('submit', async (event) => {
   if ($('#telegram-token').value.trim()) payload.telegram_bot_token = $('#telegram-token').value.trim();
   feedback.textContent = '保存中…';
   try {
-    render(await api('/api/settings', { method: 'POST', body: JSON.stringify(payload) }));
+    await api('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+    await refresh();
     $('#ai-key').value = '';
     $('#twitter-key').value = '';
     $('#smtp-password').value = '';

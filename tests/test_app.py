@@ -253,7 +253,8 @@ class FeedTests(unittest.TestCase):
     def test_assess_story_requests_strict_openrouter_json_schema(self):
         response_body = {"choices": [{"message": {"content": json.dumps({
             "verdict": "uncertain", "confidence": 0.4, "rationale": "证据不足", "evidence_gaps": ["缺少官方公告"],
-            "relevance_score": 72, "urgency": "medium", "summary_zh": "新模型更新",
+            "relevance_score": 72, "relevance_rationale": "更新涉及监控主题中的模型。",
+            "urgency": "medium", "summary_zh": "新模型更新",
             "translation": "A new model update", "translation_language": "en",
         })}}]}
         with patch("app.urllib.request.urlopen") as urlopen:
@@ -267,19 +268,87 @@ class FeedTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         body = json.loads(request.data)
         self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertEqual(body["provider"], {"require_parameters": True})
         self.assertEqual(body["response_format"]["type"], "json_schema")
         self.assertTrue(body["response_format"]["json_schema"]["strict"])
         schema = body["response_format"]["json_schema"]["schema"]
         self.assertEqual(schema["properties"]["urgency"]["enum"], ["urgent", "high", "medium", "low"])
         self.assertEqual(schema["properties"]["relevance_score"]["maximum"], 100)
+        self.assertIn("relevance_rationale", schema["required"])
         self.assertIn("summary_zh", schema["required"])
         self.assertIn("assistant", [message["role"] for message in body["messages"]])
-        self.assertIn("低于35", " ".join(message["content"] for message in body["messages"]))
+        self.assertIn("低于55", " ".join(message["content"] for message in body["messages"]))
         self.assertEqual(result["verdict"], "uncertain")
         self.assertEqual(result["relevance_score"], 72)
+        self.assertEqual(result["relevance_rationale"], "更新涉及监控主题中的模型。")
         self.assertEqual(result["urgency"], "medium")
         self.assertEqual(result["summary_zh"], "新模型更新")
         self.assertEqual(result["translation"], "A new model update")
+
+    def test_closeai_request_uses_compatible_chat_completions_without_openrouter_fields(self):
+        response_body = {"choices": [{"message": {"content": json.dumps({
+            "verdict": "uncertain", "confidence": 0.5, "relevance_score": 91,
+            "relevance_rationale": "该公告直接介绍了监控主题中的新模型。", "urgency": "high",
+            "summary_zh": "发布新模型", "translation": "", "translation_language": "zh",
+            "rationale": "来源尚待进一步核实。", "evidence_gaps": [],
+        })}}]}
+        with patch("app.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response_body).encode()
+            result = app.assess_story(
+                {"title": "A model release", "summary": "A new model is available", "source": "Outlet",
+                 "url": "https://example.com", "matched_keyword": "new model", "sources": []},
+                1,
+                {"ai_base_url": "https://api.openai-proxy.org/v1", "ai_model": "deepseek-v3.2",
+                 "ai_api_key": "closeai-test-key"},
+            )
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(request.full_url, "https://api.openai-proxy.org/v1/chat/completions")
+        self.assertEqual(request.get_header("Authorization"), "Bearer closeai-test-key")
+        self.assertEqual(body["model"], "deepseek-v3.2")
+        self.assertNotIn("provider", body)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(result["relevance_score"], 91)
+        self.assertEqual(result["relevance_rationale"], "该公告直接介绍了监控主题中的新模型。")
+
+    def test_remote_ai_endpoint_requires_key_but_local_ollama_does_not(self):
+        self.assertTrue(app.ai_api_key_required("https://api.openai-proxy.org/v1"))
+        self.assertTrue(app.ai_api_key_required("https://openrouter.ai/api/v1"))
+        self.assertFalse(app.ai_api_key_required("http://localhost:11434/v1"))
+
+    def test_assess_story_surfaces_provider_error_code_and_message(self):
+        error_body = json.dumps({"error": {"code": "model_not_found", "message": "Model not exist."}}).encode()
+        error = app.urllib.error.HTTPError(
+            "https://api.openai-proxy.org/v1/chat/completions", 404, "Not Found", {}, io.BytesIO(error_body),
+        )
+        with patch("app.urllib.request.urlopen", side_effect=error):
+            result = app.assess_story(
+                {"title": "A model release", "summary": "Details", "source": "Outlet",
+                 "url": "https://example.com"},
+                1,
+                {"ai_base_url": "https://api.openai-proxy.org/v1", "ai_model": "deepseek-v3.2",
+                 "ai_api_key": "test-key"},
+            )
+        self.assertIn("model_not_found", result["rationale"])
+        self.assertIn("Model not exist", result["rationale"])
+
+    def test_closeai_translation_request_uses_generic_compatible_api(self):
+        response_body = {"choices": [{"message": {"content": json.dumps({"english_query": "new model"})}}]}
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(app, "DB_PATH", Path(temp_dir) / "test.db"):
+            app.init_db()
+            with patch("app.urllib.request.urlopen") as urlopen:
+                urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(response_body).encode()
+                translated = app.translate_query_to_english(
+                    "CloseAI 相关性理由翻译回归测试",
+                    {"ai_base_url": "https://api.openai-proxy.org/v1", "ai_model": "deepseek-v3.2",
+                     "ai_api_key": "closeai-test-key"},
+                )
+            request = urlopen.call_args.args[0]
+            body = json.loads(request.data)
+            self.assertEqual(translated, "new model")
+            self.assertEqual(request.full_url, "https://api.openai-proxy.org/v1/chat/completions")
+            self.assertEqual(request.get_header("Authorization"), "Bearer closeai-test-key")
+            self.assertNotIn("provider", body)
 
     def test_translation_target_uses_source_language_and_script(self):
         for language in ("ja", "ko", "zh"):
@@ -301,7 +370,8 @@ class SettingsTests(unittest.TestCase):
         self.db_path = Path(self.temporary_directory.name) / "test.db"
         self.db_path_patch = patch.object(app, "DB_PATH", self.db_path)
         self.db_path_patch.start()
-        self.environment_patch = patch.dict("os.environ", {name: "" for name in app.ENV_SETTINGS.values()}, clear=False)
+        environment_names = {*app.ENV_SETTINGS.values(), *app.LEGACY_ENV_SETTINGS.values()}
+        self.environment_patch = patch.dict("os.environ", {name: "" for name in environment_names}, clear=False)
         self.environment_patch.start()
         app.init_db()
 
@@ -316,10 +386,18 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings["interval_minutes"], "5")
         self.assertEqual(settings["telegram_bot_token"], "secret")
 
+    def test_changing_ai_provider_clears_stale_key_unless_new_key_is_supplied(self):
+        app.save_settings({"ai_base_url": "https://openrouter.ai/api/v1", "ai_api_key": "old-key"})
+        app.save_settings({"ai_base_url": "https://api.openai-proxy.org/v1", "ai_model": "deepseek-v3.2"})
+        self.assertEqual(app.get_settings()["ai_api_key"], "")
+        app.save_settings({"ai_base_url": "https://openrouter.ai/api/v1", "ai_api_key": "old-key"})
+        app.save_settings({"ai_base_url": "https://api.openai-proxy.org/v1", "ai_api_key": "new-key"})
+        self.assertEqual(app.get_settings()["ai_api_key"], "new-key")
+
     def test_stories_schema_includes_urgency_relevance_and_chinese_summary(self):
         with app.connect_db() as db:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(stories)")}
-        self.assertTrue({"urgency", "relevance_score", "summary_zh"} <= columns)
+        self.assertTrue({"urgency", "relevance_score", "summary_zh", "relevance_rationale"} <= columns)
         self.assertTrue({"translation", "translation_language"} <= columns)
         with app.connect_db() as db:
             source_columns = {row["name"] for row in db.execute("PRAGMA table_info(story_sources)")}
@@ -343,8 +421,9 @@ class SettingsTests(unittest.TestCase):
 
     def test_dashboard_state_returns_persisted_story_sources(self):
         with app.connect_db() as db:
-            db.execute("INSERT INTO stories(fingerprint,title,url,discovered_at) VALUES(?,?,?,?)",
-                       ("story-one", "A headline", "https://example.com", "2026-10-31T00:00:00Z"))
+            db.execute("INSERT INTO stories(fingerprint,title,url,discovered_at,relevance_rationale) VALUES(?,?,?,?,?)",
+                       ("story-one", "A headline", "https://example.com", "2026-10-31T00:00:00Z",
+                        "与监控主题直接相关。"))
             story_id = db.execute("SELECT id FROM stories WHERE fingerprint='story-one'").fetchone()["id"]
             db.execute("""INSERT INTO story_sources
                 (story_id,platform,external_id,region,language,publisher,title,url,discovered_at,like_count,retweet_count,
@@ -357,6 +436,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(story["sources"][0]["region"], "global")
         self.assertEqual(story["sources"][0]["language"], "en")
         self.assertEqual(story["sources"][0]["like_count"], 50)
+        self.assertEqual(story["relevance_rationale"], "与监控主题直接相关。")
 
     def test_dashboard_state_can_return_more_than_eighty_stories(self):
         with app.connect_db() as db:
@@ -368,6 +448,71 @@ class SettingsTests(unittest.TestCase):
         state = app.dashboard_state(limit=120)
         self.assertEqual(len(state["stories"]), 120)
         self.assertEqual(state["total_story_count"], 125)
+
+    def test_story_sort_rules_order_by_their_own_dimensions(self):
+        stories = [
+            {"id": 1, "urgency": "low", "relevance_score": 99,
+             "published_at": "2026-11-01T10:00:00Z", "discovered_at": "2026-11-01T11:00:00Z",
+             "sources": [{"like_count": 0, "retweet_count": 0, "reply_count": 0, "view_count": 1_000_000_000}]},
+            {"id": 2, "urgency": "urgent", "relevance_score": 80,
+             "published_at": "2026-11-01T10:00:00Z", "discovered_at": "2026-11-01T09:00:00Z",
+             "sources": [{"like_count": 561, "retweet_count": 0, "reply_count": 0, "view_count": 10_000}]},
+            {"id": 3, "urgency": "high", "relevance_score": 95,
+             "published_at": "2026-11-01T11:30:00Z", "discovered_at": "2026-11-01T11:30:00Z", "sources": []},
+            {"id": 4, "urgency": "medium", "relevance_score": 95,
+             "published_at": "", "discovered_at": "2026-11-01T12:00:00Z", "sources": []},
+        ]
+        expected = {
+            "recent": [4, 3, 1, 2],
+            "discovered": [4, 3, 1, 2],
+            "relevance": [1, 4, 3, 2],
+            "importance": [2, 3, 4, 1],
+            "hot": [2, 1, 4, 3],
+        }
+        for sort_by, expected_ids in expected.items():
+            with self.subTest(sort_by=sort_by):
+                ordered = app.sort_stories(stories, sort_by)
+                self.assertEqual([story["id"] for story in ordered], expected_ids)
+
+    def test_dashboard_relevance_sort_includes_stories_beyond_newest_500(self):
+        with app.connect_db() as db:
+            db.executemany(
+                "INSERT INTO stories(fingerprint,title,url,discovered_at,relevance_score) VALUES(?,?,?,?,?)",
+                [(f"story-{index}", f"Headline {index}", "https://example.com",
+                  "2026-10-31T00:00:00Z", 10) for index in range(500)],
+            )
+            db.execute(
+                "INSERT INTO stories(fingerprint,title,url,discovered_at,relevance_score) VALUES(?,?,?,?,?)",
+                ("old-relevant-story", "Older relevant headline", "https://example.com",
+                 "2026-01-01T00:00:00Z", 99),
+            )
+        first_page = app.dashboard_state(limit=30, sort_by="relevance", page=1)
+        second_page = app.dashboard_state(limit=30, sort_by="relevance", page=2)
+        first_ids = {story["id"] for story in first_page["stories"]}
+        second_ids = {story["id"] for story in second_page["stories"]}
+        self.assertEqual(first_page["stories"][0]["fingerprint"], "old-relevant-story")
+        self.assertEqual(first_page["filtered_story_count"], 501)
+        self.assertTrue(first_page["has_more"])
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+
+    def test_state_api_forwards_pagination_filters_and_sort(self):
+        class HandlerProbe:
+            path = "/api/state?pageSize=7&sort=hot&page=2&urgency=high&source=twitterapi.io&relevance=80"
+            status = None
+            payload = None
+
+            def _json(self, status, payload):
+                self.status = status
+                self.payload = payload
+
+        probe = HandlerProbe()
+        with patch.object(app, "dashboard_state", return_value={"stories": []}) as dashboard_state:
+            app.Handler.do_GET(probe)
+        self.assertEqual(probe.status, 200)
+        dashboard_state.assert_called_once_with(
+            limit=7, sort_by="hot", page=2, urgency="high",
+            source_platform="twitterapi.io", minimum_relevance=80,
+        )
 
     def test_dashboard_state_marks_ai_failures_as_unavailable_not_zero_relevance(self):
         with app.connect_db() as db:
@@ -460,9 +605,10 @@ class SettingsTests(unittest.TestCase):
         with app.connect_db() as db:
             db.execute("INSERT INTO keywords(phrase,created_at) VALUES(?,?)",
                        ("AI coding", "2026-10-31T00:00:00Z"))
-            db.execute("INSERT INTO stories(fingerprint,title,url,source,discovered_at) VALUES(?,?,?,?,?)",
+            db.execute("INSERT INTO stories(fingerprint,title,url,source,discovered_at,relevance_rationale) VALUES(?,?,?,?,?,?)",
                        (app.hashlib.sha256(app.normalize_title("A coding update").encode()).hexdigest(),
-                        "A coding update", "https://x.com/example/status/1", "X @example", "2026-10-31T00:00:00Z"))
+                        "A coding update", "https://x.com/example/status/1", "X @example", "2026-10-31T00:00:00Z",
+                        "与代码更新主题直接相关。"))
             story_id = db.execute("SELECT id FROM stories").fetchone()["id"]
             source = {
                 "platform": "twitterapi.io", "external_id": "post-1", "publisher": "example",
@@ -521,14 +667,15 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual([source["publisher"] for source in story["sources"]], ["example", "Reuters"])
 
     def test_nonempty_environment_key_overrides_saved_key_and_empty_keeps_saved(self):
-        app.save_settings({"ai_api_key": "saved-key"})
+        app.save_settings({"ai_base_url": "https://openrouter.ai/api/v1", "ai_api_key": "saved-key"})
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "environment-key"}, clear=False):
             self.assertEqual(app.get_settings()["ai_api_key"], "environment-key")
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}, clear=False):
             self.assertEqual(app.get_settings()["ai_api_key"], "saved-key")
 
-    def test_default_openrouter_without_key_is_not_marked_configured(self):
-        self.assertEqual(app.get_settings()["ai_model"], "deepseek/deepseek-v4.1-flash")
+    def test_default_closeai_without_key_is_not_marked_configured(self):
+        self.assertEqual(app.get_settings()["ai_base_url"], "https://api.openai-proxy.org/v1")
+        self.assertEqual(app.get_settings()["ai_model"], "deepseek-v4.1-flash")
         self.assertFalse(app.dashboard_state()["settings"]["ai_configured"])
 
     def test_start_scan_runs_worker_and_releases_lock(self):

@@ -1,6 +1,6 @@
 # AI 热探 Signal Desk
 
-面向 AI 编程创作者的个人热点监控台。按关键词和主题检索国内与国际资讯，保留原始来源，结合 OpenRouter 模型和独立发布者证据核验，并通过浏览器实时提醒和 SMTP 邮件发送紧急/高优先级热点。
+面向 AI 编程创作者的个人热点监控台。按关键词和主题检索国内与国际资讯，保留原始来源，结合 OpenAI 兼容模型和独立发布者证据核验，并通过浏览器实时提醒和 SMTP 邮件发送紧急/高优先级热点。
 
 页面文件本身是静态 HTML/CSS/JavaScript，但热点数据由本地 Python 服务从 SQLite/API 动态加载。页面打开时通过 WebSocket 实时接收新热点，并以 15 秒轮询作为状态刷新兜底；后台按设置的间隔扫描，默认 30 分钟。
 
@@ -29,12 +29,12 @@ py -3 app.py
 - 添加明确的 `@handle`、X 主页 URL 或 UID 时，直接读取账号资料与原创动态；普通文本仍按话题搜索。Bilibili/微博账号 URL 会被识别，但因当前探测到访问控制且没有已验证的合规公开接口，扫描会说明未启用，不会尝试绕过。
 - 来源按发布者/域名去重并保留原始链接、区域与语言。
 - 真实性判断是独立标签：模型可判为 `credible`（可信）、`suspicious`（可疑）、`uncertain`（待核验）或 `unverified`（未核验）。`credible` 还需官方域名/账号，或至少两个不同受信发布者（如 Reuters、AP、BBC、财新等）支持；不满足时降为 `uncertain`。
-- 缺少 OpenRouter Key 或证据不足时，内容仍会展示，但标记为未核验/待观察；真实性不会被伪装成“已核实”。
+- 缺少远程 AI API Key 或证据不足时，内容仍会展示，但标记为未核验/待观察；真实性不会被伪装成“已核实”。
 
 ## 模型与通知
 在 `.env` 或页面“连接与设置”填写凭据，不要把密钥贴进聊天或提交到仓库。系统环境变量优先于 `.env`，两者优先于页面/数据库设置；空白变量不会覆盖已有值。
 
-- **OpenRouter**：设置 `OPENROUTER_API_KEY`；默认 Base URL 为 `https://openrouter.ai/api/v1`，模型为 `deepseek/deepseek-v4.1-flash`。程序使用严格 JSON Schema 请求结构化核验结果。
+- **AI 核验**：支持 OpenAI 兼容接口。默认使用 CloseAI Base URL `https://api.openai-proxy.org/v1` 与模型 `deepseek-v4.1-flash`，通过 `AI_API_KEY` 配置 CloseAI Key；也可在页面设置切换到 OpenRouter 等服务。旧环境变量 `OPENROUTER_BASE_URL`、`OPENROUTER_MODEL`、`OPENROUTER_API_KEY` 仍兼容。CloseAI 使用 JSON 对象模式请求结构化核验结果，并单独生成相关性理由。
 - **TwitterAPI.io**：设置 `TWITTERAPI_API_KEY`。缺少此 Key 时不会调用 X 搜索。
 - **SMTP 邮件**：设置 `SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_SENDER`、`SMTP_RECIPIENT` 和 TLS 配置；保存后可发送测试邮件。邮件与实时提醒仅对紧急度为 `urgent`（紧急）或 `high`（高）且通过应用层证据门槛判为可信的热点触发。
 - `.env` 已在 `.gitignore` 中。页面设置凭据保存在本机 SQLite；服务状态 API 仅返回是否已配置，不回传密钥。AI/X/SMTP 不可用时，扫描不会因单一依赖失败而停止。
@@ -79,10 +79,10 @@ py -3 app.py
 - **真实性独立标签**：`credible/suspicious/uncertain/unverified` 不再作为主分组，仅作为真实性标签展示。
 - **来源扩展与 X 质量门槛**：新增 Bing RSS、DuckDuckGo 和 Hacker News；X 使用 Top/Latest 游标分页，候选采集与最终质量门槛分离，历史数据库记录也在 API 响应前复核。
 - **提醒门槛**：邮件与实时提醒仅发送紧急/高优先级且通过应用层可信门槛的热点。
-- **相关性与摘要**：AI 输出 0–100 相关性评分与中文摘要，前端卡片与邮件中展示。
+- **相关性与摘要**：AI 输出 0–100 相关性评分、独立相关性理由与中文摘要；理由可逐条展开，或一键展开/折叠全部。
 - **前端体验**：深色科技主题与克制动效（极光、光束、流星、Spotlight、打字机等），`prefers-reduced-motion` 下自动关闭。
 - **刷新策略**：移除 15 秒全量轮询，改为 30 秒轻量监听扫描完成后再刷新，WebSocket 即时推送 urgent/high，避免界面闪烁。
-- **更多信号与筛选**：状态 API 默认最多返回 500 条，界面每次展示 30 条并可继续加载；支持按来源、紧急度、最低相关性筛选，以及按相关性排序。
+- **更多信号与筛选**：状态 API 对全量记录筛选和排序后再分页，界面每次加载 30 条并可继续加载；支持按来源、紧急度、最低相关性筛选，以及按最新发布、最新发现、相关性、重要程度和热度综合排序。
 - **来源就地预览**：每条热点直接显示最多 3 条来源标题、摘要摘录和时间，其余来源可展开；打开原文仍是可选操作。
 - **相关性 few-shot**：审核提示包含主题不匹配与直接相关的示例，要求真实性与相关性分开判断，并降低泛化/重复/无实质更新内容的分数。相关性 35+ 为默认筛选，未核验内容仍可见。
 - **多语言译文**：审核结果增加译文；日语、韩语等非中英内容优先译为中文，西语/法语译为英文，译文在工作台内显示。
@@ -91,7 +91,7 @@ py -3 app.py
 
 将 [`skills/ai-hot-monitor/SKILL.md`](skills/ai-hot-monitor/SKILL.md) 提供给其他 AI。Skill 描述本地 API、国内外实时搜索、证据核验、结果报告和密钥安全要求。
 
-本地 API：`GET /api/state`、`GET /api/health`、`POST /api/keywords`、`DELETE /api/keywords/{id}`、`POST /api/scan`、`POST /api/settings`、`POST /api/notifications/test-email`。
+本地 API：`GET /api/state?page=1&pageSize=30&sort=recent&urgency=all&source=all&relevance=0`、`GET /api/health`、`POST /api/keywords`、`DELETE /api/keywords/{id}`、`POST /api/scan`、`POST /api/settings`、`POST /api/notifications/test-email`。`sort` 支持 `recent`、`discovered`、`relevance`、`importance`、`hot`。
 
 ## 测试
 

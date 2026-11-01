@@ -5,6 +5,8 @@ from contextlib import contextmanager
 import hashlib
 import html
 import json
+import logging
+import math
 import os
 import re
 import smtplib
@@ -20,6 +22,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterator
 from dotenv import load_dotenv
@@ -32,8 +35,8 @@ DB_PATH = Path(os.environ.get("AI_HOT_MONITOR_DB", ROOT / "data" / "monitor.db")
 DEFAULTS = {
     "scope": "AI 编程",
     "interval_minutes": "30",
-    "ai_base_url": "https://openrouter.ai/api/v1",
-    "ai_model": "deepseek/deepseek-v4.1-flash",
+    "ai_base_url": "https://api.openai-proxy.org/v1",
+    "ai_model": "deepseek-v4.1-flash",
     "ai_api_key": "",
     "twitter_api_key": "",
     "smtp_host": "",
@@ -50,9 +53,9 @@ DEFAULTS = {
 ENV_SETTINGS = {
     "scope": "AI_HOT_MONITOR_SCOPE",
     "interval_minutes": "AI_HOT_MONITOR_INTERVAL_MINUTES",
-    "ai_base_url": "OPENROUTER_BASE_URL",
-    "ai_model": "OPENROUTER_MODEL",
-    "ai_api_key": "OPENROUTER_API_KEY",
+    "ai_base_url": "AI_BASE_URL",
+    "ai_model": "AI_MODEL",
+    "ai_api_key": "AI_API_KEY",
     "twitter_api_key": "TWITTERAPI_API_KEY",
     "smtp_host": "SMTP_HOST",
     "smtp_port": "SMTP_PORT",
@@ -65,8 +68,16 @@ ENV_SETTINGS = {
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "TELEGRAM_CHAT_ID",
 }
+LEGACY_ENV_SETTINGS = {
+    "ai_base_url": "OPENROUTER_BASE_URL",
+    "ai_model": "OPENROUTER_MODEL",
+    "ai_api_key": "OPENROUTER_API_KEY",
+}
 SCAN_LOCK = threading.Lock()
-SCAN_STATE: dict[str, Any] = {"running": False, "error": None, "last_started": None}
+SCAN_STATE: dict[str, Any] = {"running": False, "error": None, "last_started": None, "progress": ""}
+SCAN_LOGGER = logging.getLogger("ai_hot_monitor.scan")
+SCAN_LOG_LOCK = threading.Lock()
+SCAN_LOG_PATH = ROOT / "data" / "monitor.log"
 WS_CLIENTS: set[ServerConnection] = set()
 WS_LOOP: asyncio.AbstractEventLoop | None = None
 TWITTER_REQUEST_LOCK = threading.Lock()
@@ -344,6 +355,7 @@ def init_db() -> None:
                 translation TEXT NOT NULL DEFAULT '',
                 translation_language TEXT NOT NULL DEFAULT '',
                 rationale TEXT NOT NULL DEFAULT '',
+                relevance_rationale TEXT NOT NULL DEFAULT '',
                 corroborations INTEGER NOT NULL DEFAULT 1,
                 discovered_at TEXT NOT NULL,
                 notified INTEGER NOT NULL DEFAULT 0
@@ -384,6 +396,11 @@ def init_db() -> None:
                 english TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS query_expansions (
+                original TEXT PRIMARY KEY,
+                expanded TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
@@ -394,6 +411,7 @@ def init_db() -> None:
             ("summary_zh", "TEXT NOT NULL DEFAULT ''"),
             ("translation", "TEXT NOT NULL DEFAULT ''"),
             ("translation_language", "TEXT NOT NULL DEFAULT ''"),
+            ("relevance_rationale", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in story_columns:
                 db.execute(f"ALTER TABLE stories ADD COLUMN {column} {declaration}")
@@ -425,9 +443,17 @@ def get_settings() -> dict[str, str]:
     settings = {**DEFAULTS, **values}
     for setting, environment_name in ENV_SETTINGS.items():
         value = os.environ.get(environment_name, "").strip()
+        legacy_openrouter_config = "openrouter.ai" in settings.get("ai_base_url", "")
+        if not value and setting in LEGACY_ENV_SETTINGS and legacy_openrouter_config:
+            value = os.environ.get(LEGACY_ENV_SETTINGS[setting], "").strip()
         if value:
             settings[setting] = value
     return settings
+
+
+def ai_api_key_required(base_url: str) -> bool:
+    hostname = (urllib.parse.urlparse(base_url).hostname or "").casefold()
+    return hostname not in {"localhost", "127.0.0.1", "::1", "ollama"} and not hostname.endswith(".local")
 
 
 def save_settings(values: dict[str, Any]) -> None:
@@ -455,6 +481,13 @@ def save_settings(values: dict[str, Any]) -> None:
     for key in ("smtp_starttls", "smtp_use_ssl"):
         if key in updates:
             updates[key] = "1" if updates[key].lower() in {"1", "true", "yes", "on"} else "0"
+    if "ai_base_url" in updates and "ai_api_key" not in updates:
+        with connect_db() as db:
+            saved_base_url = db.execute("SELECT value FROM settings WHERE key='ai_base_url'").fetchone()
+        previous_host = urllib.parse.urlparse(saved_base_url["value"] if saved_base_url else "").hostname
+        next_host = urllib.parse.urlparse(updates["ai_base_url"]).hostname
+        if previous_host and next_host and previous_host.casefold() != next_host.casefold():
+            updates["ai_api_key"] = ""
     with connect_db() as db:
         db.executemany("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", updates.items())
 
@@ -609,7 +642,7 @@ def translate_query_to_english(query: str, settings: dict[str, str]) -> str:
     base_url = settings.get("ai_base_url", "").rstrip("/")
     model = settings.get("ai_model", "").strip()
     api_key = settings.get("ai_api_key", "").strip()
-    if not base_url or not model or ("openrouter.ai" in base_url and not api_key):
+    if not base_url or not model or (ai_api_key_required(base_url) and not api_key):
         return ""
 
     schema = {
@@ -618,20 +651,24 @@ def translate_query_to_english(query: str, settings: dict[str, str]) -> str:
         "required": ["english_query"],
         "additionalProperties": False,
     }
-    body = json.dumps({
+    body_data = {
         "model": model,
         "temperature": 0,
         "max_tokens": 96,
         "messages": [
-            {"role": "system", "content": "Translate search terms into concise natural English keywords. Return only the translated query."},
+            {"role": "system", "content": "Translate search terms into concise natural English keywords. Return only a JSON object with an english_query string."},
             {"role": "user", "content": query},
         ],
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": "search_query", "strict": True, "schema": schema},
         },
-        "provider": {"require_parameters": True},
-    }).encode("utf-8")
+    }
+    if "openrouter.ai" in base_url:
+        body_data["provider"] = {"require_parameters": True}
+    else:
+        body_data["response_format"] = {"type": "json_object"}
+    body = json.dumps(body_data).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -649,6 +686,83 @@ def translate_query_to_english(query: str, settings: dict[str, str]) -> str:
         return english
     except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
         return ""
+
+
+def expand_search_query(query: str, settings: dict[str, str]) -> list[str]:
+    with connect_db() as db:
+        cached = db.execute("SELECT expanded FROM query_expansions WHERE original=?", (query,)).fetchone()
+    if cached:
+        try:
+            expansions = json.loads(cached["expanded"])
+            return [str(item) for item in expansions if str(item).strip()][:2]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    base_url = settings.get("ai_base_url", "").rstrip("/")
+    model = settings.get("ai_model", "").strip()
+    api_key = settings.get("ai_api_key", "").strip()
+    if not base_url or not model or (ai_api_key_required(base_url) and not api_key):
+        return []
+
+    schema = {
+        "type": "object",
+        "properties": {"queries": {"type": "array", "items": {"type": "string"}, "maxItems": 2}},
+        "required": ["queries"],
+        "additionalProperties": False,
+    }
+    body_data = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 120,
+        "messages": [
+            {"role": "system", "content": (
+                "为给定的热点监控词生成最多两个具体、紧密相关的搜索短语，可用产品名、常见别称或直接相关功能；"
+                "不要扩展成泛化的 AI/科技词。只返回 JSON 对象 queries。"
+            )},
+            {"role": "user", "content": query},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "query_expansion", "strict": True, "schema": schema},
+        },
+    }
+    if "openrouter.ai" in base_url:
+        body_data["provider"] = {"require_parameters": True}
+    else:
+        body_data["response_format"] = {"type": "json_object"}
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions", data=json.dumps(body_data).encode("utf-8"),
+        headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {api_key}"} if api_key else {})},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read(500_000))
+        content = payload["choices"][0]["message"]["content"]
+        result = json.loads(content)
+        expansions = []
+        for item in result.get("queries", []):
+            phrase = re.sub(r"\s+", " ", str(item)).strip()[:100]
+            if phrase and phrase.casefold() != query.casefold() and phrase.casefold() not in {
+                existing.casefold() for existing in expansions
+            }:
+                expansions.append(phrase)
+            if len(expansions) == 2:
+                break
+        with connect_db() as db:
+            db.execute("INSERT OR REPLACE INTO query_expansions(original,expanded,updated_at) VALUES(?,?,?)",
+                       (query, json.dumps(expansions, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+        return expansions
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        log_scan(f"[warning] Query Expand for '{query}' unavailable: {str(exc)[:120]}")
+        return []
+
+
+def build_search_query(*terms: str) -> str:
+    unique_terms = list(dict.fromkeys(term.strip() for term in terms if term and term.strip()))
+    if len(unique_terms) < 2:
+        return unique_terms[0] if unique_terms else ""
+    return " OR ".join(f'"{term.replace(chr(34), "")}"' for term in unique_terms)
 
 
 def translation_target_for_story(story: dict[str, Any]) -> str:
@@ -674,12 +788,12 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
     model = settings.get("ai_model", "").strip()
     if not base_url or not model:
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-            "summary_zh": "", "translation": "", "translation_language": translation_language,
+            "summary_zh": "", "relevance_rationale": "", "translation": "", "translation_language": translation_language,
             "rationale": "未配置 AI 核验模型。"}
-    if "openrouter.ai" in base_url and not settings.get("ai_api_key", "").strip():
+    if ai_api_key_required(base_url) and not settings.get("ai_api_key", "").strip():
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-            "summary_zh": "", "translation": "", "translation_language": translation_language,
-            "rationale": "未配置 OpenRouter API Key。"}
+            "summary_zh": "", "relevance_rationale": "", "translation": "", "translation_language": translation_language,
+            "rationale": "未配置 AI API Key。"}
 
     evidence = story.get("sources", [])
     evidence_text = "\n".join(
@@ -691,11 +805,15 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
     prompt = (
         "你是个人热点筛选助手，优先保留对用户监控主题有直接价值的新消息。真实性、主题相关性和紧急度是三个独立维度。"
         "真实性谨慎识别冒充官方、旧闻翻炒、夸张标题和无来源消息，证据不足时返回 uncertain。"
-        "relevance_score 表示对监控主题的直接匹配和实际信息价值，范围0-100；只共享宽泛行业词、泛化教程、招聘广告、旧闻复述或无实质更新的内容应低于35。"
+        "relevance_score 表示对监控主题的直接匹配和实际信息价值，范围0-100；50-60分为有一定相关性但需结合理由判断的区间，低于55分默认不进入工作台的相关性筛选结果。"
+        "根据原始关键词及查询扩展词判断语义相关性，不要求标题或正文逐字包含原始关键词；扩展词只用于理解同一产品、别称或直接相关功能，不可据此泛化到整个AI行业。"
+        "relevance_rationale 用简体中文简要解释该内容为什么与监控主题相关或不相关，结合标题/摘要中的具体信息，不得重复标题。"
+        "最终只返回一个 JSON 对象，包含要求的全部字段，不要 Markdown 代码块或额外说明。"
         "不要因为出现 AI、模型或科技名词就判高相关。urgency 根据现实影响和时效选择 urgent/high/medium/low。"
         f"summary_zh 用简洁中文概括；translation 将原文核心内容翻译为{target_name}，若原文已经是目标语言则返回空字符串。"
         "只根据给定来源，不要把推测说成事实。\n"
-        f"监控主题/关键词：{story.get('matched_keyword', '')}\n标题：{story['title']}\n摘要：{story['summary']}\n发布源：{story['source']}\n"
+        f"监控主题/关键词：{story.get('matched_keyword', '')}\n查询扩展词：{', '.join(story.get('query_expansions', [])) or '无'}\n"
+        f"标题：{story['title']}\n摘要：{story['summary']}\n发布源：{story['source']}\n"
         f"独立发布者数：{corroborations}\n链接域名：{urllib.parse.urlparse(story['url']).netloc}\n"
         f"来源证据：\n{evidence_text}"
     )
@@ -703,21 +821,25 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
         {"role": "user", "content": "监控主题：Claude Code。标题：MacBook 新款屏幕亮度提升。摘要：苹果更新笔记本显示屏参数，与 Claude Code 无直接关系。"},
         {"role": "assistant", "content": json.dumps({
             "verdict": "uncertain", "confidence": 0.3, "relevance_score": 8, "urgency": "low",
-            "summary_zh": "苹果更新笔记本屏幕参数。", "rationale": "内容没有涉及 Claude Code 或其直接关联产品。",
+            "summary_zh": "苹果更新笔记本屏幕参数。",
+            "relevance_rationale": "内容只涉及屏幕参数，与 Claude Code 无直接关联。",
+            "rationale": "内容没有涉及 Claude Code 或其直接关联产品。",
             "evidence_gaps": ["缺少与监控主题相关的事实"], "translation": "", "translation_language": "en",
         }, ensure_ascii=False)},
         {"role": "user", "content": "监控主题：OpenAI Codex 编程代理。标题：OpenAI 为 Codex 增加后台任务。摘要：官方更新说明 Codex 可在后台并行执行开发任务。"},
         {"role": "assistant", "content": json.dumps({
             "verdict": "uncertain", "confidence": 0.55, "relevance_score": 94, "urgency": "high",
-            "summary_zh": "Codex 新增后台并行任务能力。", "rationale": "官方产品更新与监控主题直接相关；真实性仍需按来源证据判断。",
+            "summary_zh": "Codex 新增后台并行任务能力。",
+            "relevance_rationale": "更新直接涉及 Codex 的开发能力，与监控主题高度匹配。",
+            "rationale": "官方产品更新与监控主题直接相关；真实性仍需按来源证据判断。",
             "evidence_gaps": ["需核对官方更新原文"], "translation": "", "translation_language": "en",
         }, ensure_ascii=False)},
     ]
-    body = json.dumps({
+    body_data = {
         "model": model,
         "temperature": 0.1,
         "messages": [
-            {"role": "system", "content": "按示例校准主题匹配度。相关性低不等于内容虚假；缺乏证据时真实性必须判为 uncertain。"},
+            {"role": "system", "content": "按示例校准主题匹配度。相关性低不等于内容虚假；缺乏证据时真实性必须判为 uncertain。只返回符合要求的 JSON 对象，不要 Markdown 或额外文本。"},
             *few_shot,
             {"role": "user", "content": prompt},
         ],
@@ -732,6 +854,7 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
                         "verdict": {"type": "string", "enum": ["credible", "suspicious", "uncertain"]},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "relevance_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "relevance_rationale": {"type": "string"},
                         "urgency": {"type": "string", "enum": ["urgent", "high", "medium", "low"]},
                         "summary_zh": {"type": "string"},
                         "translation": {"type": "string"},
@@ -740,13 +863,17 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
                         "evidence_gaps": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["verdict", "confidence", "relevance_score", "urgency", "summary_zh",
-                                 "translation", "translation_language", "rationale", "evidence_gaps"],
+                                 "relevance_rationale", "translation", "translation_language", "rationale", "evidence_gaps"],
                     "additionalProperties": False,
                 },
             },
         },
-        "provider": {"require_parameters": True},
-    }).encode("utf-8")
+    }
+    if "openrouter.ai" in base_url:
+        body_data["provider"] = {"require_parameters": True}
+    else:
+        body_data["response_format"] = {"type": "json_object"}
+    body = json.dumps(body_data).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if settings.get("ai_api_key"):
         headers["Authorization"] = f"Bearer {settings['ai_api_key']}"
@@ -777,13 +904,29 @@ def assess_story(story: dict[str, Any], corroborations: int, settings: dict[str,
             "relevance_score": relevance,
             "urgency": urgency,
             "summary_zh": str(result.get("summary_zh", ""))[:500],
+            "relevance_rationale": str(result.get("relevance_rationale", ""))[:500],
             "translation": str(result.get("translation", ""))[:1200],
             "translation_language": translation_language,
             "rationale": str(result.get("rationale", "模型未提供理由"))[:240],
         }
+    except urllib.error.HTTPError as exc:
+        try:
+            error_payload = json.loads(exc.read(500_000))
+            error_info = error_payload.get("error", {})
+            error_code = str(error_info.get("code") or "").strip()
+            error_message = str(error_info.get("message") or exc.reason).strip()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            error_code = ""
+            error_message = str(exc.reason)
+        error_detail = f"HTTP {exc.code}"
+        if error_code:
+            error_detail += f" {error_code}"
+        return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
+                "summary_zh": "", "relevance_rationale": "", "translation": "", "translation_language": translation_language,
+                "rationale": f"AI 核验不可用：{error_detail} {error_message}"[:240]}
     except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
         return {"verdict": "unverified", "confidence": 0, "relevance_score": 0, "urgency": "medium",
-                "summary_zh": "", "translation": "", "translation_language": translation_language,
+            "summary_zh": "", "relevance_rationale": "", "translation": "", "translation_language": translation_language,
                 "rationale": f"AI 核验不可用：{str(exc)[:120]}"}
 
 
@@ -1028,7 +1171,16 @@ def get_enabled_keywords() -> list[str]:
 
 
 def log_scan(message: str) -> None:
-    print(message, flush=True)
+    text = str(message)
+    SCAN_STATE["progress"] = text
+    print(text, flush=True)
+    try:
+        SCAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SCAN_LOG_LOCK:
+            with SCAN_LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now(timezone.utc).isoformat()} {text}\n")
+    except OSError:
+        pass
 
 
 def save_story_source(db: sqlite3.Connection, story_id: int, source: dict[str, Any], discovered_at: str) -> bool:
@@ -1101,7 +1253,7 @@ def save_story_source(db: sqlite3.Connection, story_id: int, source: dict[str, A
 
 def run_scan() -> None:
     started = datetime.now(timezone.utc).isoformat()
-    SCAN_STATE.update(running=True, error=None, last_started=started)
+    SCAN_STATE.update(running=True, error=None, last_started=started, progress="准备扫描")
     settings = get_settings()
     queries = list(dict.fromkeys(get_enabled_keywords()))
     scope = ", ".join(queries) or "manual"
@@ -1130,6 +1282,9 @@ def run_scan() -> None:
             log_scan(f"[skip] {query}: {message}")
             continue
         english_query = translate_query_to_english(query, settings)
+        expansions = expand_search_query(query, settings)
+        if expansions:
+            log_scan(f"[query expand] {query} -> {', '.join(expansions)}")
         if re.search(r"[\u4e00-\u9fff]", query) and not english_query:
             translation_warning = True
         for region, regional_query in (("china", query), ("global", english_query or query)):
@@ -1146,6 +1301,7 @@ def run_scan() -> None:
                     log_scan(f'{provider} search for "{regional_query}" ({region}): found {len(results)} results')
                     for source in results:
                         source["matched_keyword"] = query
+                        source["query_expansions"] = expansions
                         items.append({**source, "sources": [source]})
                 except (OSError, ValueError, ET.ParseError, urllib.error.URLError) as exc:
                     message = f"{provider} / {query}: {str(exc)[:100]}"
@@ -1161,6 +1317,7 @@ def run_scan() -> None:
                 log_scan(f'Hacker News search for "{hn_query}": found {len(hn_results)} results')
                 for source in hn_results:
                     source["matched_keyword"] = query
+                    source["query_expansions"] = expansions
                     items.append({**source, "sources": [source]})
             except (OSError, ValueError, urllib.error.URLError) as exc:
                 message = f"Hacker News / {query}: {str(exc)[:100]}"
@@ -1184,6 +1341,7 @@ def run_scan() -> None:
                 )
                 for source in x_sources:
                     source["matched_keyword"] = query
+                    source["query_expansions"] = expansions
                     items.append({**source, "sources": [source]})
             except (OSError, ValueError, urllib.error.URLError) as exc:
                 message = f"X / {query}: {str(exc)[:100]}"
@@ -1201,9 +1359,14 @@ def run_scan() -> None:
 
     clusters = cluster_stories(items)
     log_scan(f"[results] {len(items)} raw -> {len(clusters)} title clusters; X quality-eligible: {twitter_eligible_count}")
+    if len(clusters) > 30:
+        log_scan(f"[limit] analyzing first 30 of {len(clusters)} clusters")
+        clusters = clusters[:30]
     found_count = 0
     existing_count = 0
-    for story in clusters:
+    for index, story in enumerate(clusters, 1):
+        SCAN_STATE.update(progress=f"AI 分析 {index}/{len(clusters)}: {str(story.get('title', ''))[:80]}")
+        log_scan(f"[assess {index}/{len(clusters)}] {str(story.get('title', ''))[:120]}")
         normalized = normalize_title(story["title"])
         if not normalized:
             continue
@@ -1212,7 +1375,8 @@ def run_scan() -> None:
         is_new_story = False
         with connect_db() as db:
             existing = db.execute("""SELECT id,notified,verdict,confidence,relevance_score,urgency,summary_zh,
-                translation,translation_language,rationale FROM stories WHERE fingerprint=?""", (fingerprint,)).fetchone()
+                translation,translation_language,rationale,relevance_rationale FROM stories WHERE fingerprint=?""",
+                (fingerprint,)).fetchone()
             if existing:
                 story_id = existing["id"]
                 was_notified = bool(existing["notified"])
@@ -1242,10 +1406,10 @@ def run_scan() -> None:
 
         corroborations, official = verification_evidence(evidence)
         story["sources"] = evidence
-        if existing and not source_changed:
+        if existing and not source_changed and existing["relevance_rationale"]:
             assessment = {key: existing[key] for key in (
                 "verdict", "confidence", "relevance_score", "urgency", "summary_zh",
-                "translation", "translation_language", "rationale",
+                "translation", "translation_language", "rationale", "relevance_rationale",
             )}
         else:
             assessment = assess_story(story, corroborations, settings)
@@ -1261,11 +1425,11 @@ def run_scan() -> None:
         )
         with connect_db() as db:
             db.execute("""UPDATE stories SET verdict=?,confidence=?,relevance_score=?,urgency=?,summary_zh=?,
-                translation=?,translation_language=?,rationale=?,corroborations=? WHERE id=?""", (
+                translation=?,translation_language=?,rationale=?,relevance_rationale=?,corroborations=? WHERE id=?""", (
                 assessment.get("verdict", "uncertain"), assessment.get("confidence", 0), assessment.get("relevance_score", 0),
                 assessment.get("urgency", "medium"), assessment.get("summary_zh", ""), assessment.get("translation", ""),
                 assessment.get("translation_language", ""), assessment.get("rationale", ""),
-                corroborations, story_id,
+                assessment.get("relevance_rationale", ""), corroborations, story_id,
             ))
         if is_new_story:
             title = re.sub(r"\s+", " ", str(story.get("title", ""))).strip()
@@ -1299,38 +1463,113 @@ def start_scan() -> bool:
         try:
             run_scan()
         except Exception as exc:
-            SCAN_STATE.update(running=False, error=str(exc)[:240])
+            SCAN_STATE.update(running=False, error=str(exc)[:240], progress=f"扫描失败：{str(exc)[:120]}")
             log_scan(f"[scan error] {str(exc)[:240]}")
         finally:
-            SCAN_LOCK.release()
-            publish_websocket({"type": "scan_completed"})
+            try:
+                SCAN_LOCK.release()
+            except RuntimeError:
+                pass
+            try:
+                publish_websocket({"type": "scan_completed"})
+            except Exception:
+                pass
 
     threading.Thread(target=worker, daemon=True, name="hot-monitor-scan").start()
     return True
 
 
-def dashboard_state(limit: int = 500) -> dict[str, Any]:
+STORY_SORTS = {"recent", "discovered", "relevance", "importance", "hot"}
+URGENCY_RANK = {"urgent": 4, "high": 3, "medium": 2, "low": 1}
+
+
+def _story_timestamp(value: Any) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def calculate_hot_score(story: dict[str, Any]) -> float:
+    score = 0.0
+    for source in story.get("sources", []):
+        def metric(name: str) -> int:
+            try:
+                return max(0, int(source.get(name) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        views = metric("view_count")
+        score += metric("like_count") + metric("retweet_count") * 2 + metric("reply_count")
+        score += math.log10(max(views, 1)) * 10
+    return score
+
+
+def sort_stories(stories: list[dict[str, Any]], sort_by: str = "recent") -> list[dict[str, Any]]:
+    if sort_by not in STORY_SORTS:
+        sort_by = "recent"
+
+    def key(story: dict[str, Any]) -> tuple[float, ...]:
+        discovered = _story_timestamp(story.get("discovered_at"))
+        published = _story_timestamp(story.get("published_at")) or discovered
+        relevance = float(story.get("relevance_score") or 0)
+        importance = URGENCY_RANK.get(str(story.get("urgency", "medium")).lower(), 0)
+        hot = calculate_hot_score(story)
+        try:
+            story_id = int(story.get("id") or 0)
+        except (TypeError, ValueError, OverflowError):
+            story_id = 0
+
+        if sort_by == "relevance":
+            return (-relevance, -published, -discovered, -story_id)
+        if sort_by == "importance":
+            return (-importance, -relevance, -discovered, -story_id)
+        if sort_by == "hot":
+            return (-hot, -discovered, -story_id)
+        if sort_by == "discovered":
+            return (-discovered, -story_id)
+        return (-published, -discovered, -story_id)
+
+    return sorted(stories, key=key)
+
+
+def dashboard_state(
+    limit: int = 500,
+    sort_by: str = "recent",
+    page: int = 1,
+    urgency: str = "all",
+    source_platform: str = "all",
+    minimum_relevance: int = 0,
+) -> dict[str, Any]:
     limit = max(1, min(500, int(limit)))
+    page = max(1, int(page))
+    sort_by = sort_by if sort_by in STORY_SORTS else "recent"
+    urgency = urgency if urgency in {*URGENCY_RANK, "all"} else "all"
+    try:
+        minimum_relevance = max(0, min(100, int(minimum_relevance)))
+    except (TypeError, ValueError, OverflowError):
+        minimum_relevance = 0
     settings = get_settings()
     with connect_db() as db:
         keywords = [dict(row) for row in db.execute("SELECT id,phrase,created_at,enabled FROM keywords ORDER BY id DESC")]
-        stories = [dict(row) for row in db.execute(
-            "SELECT * FROM stories ORDER BY discovered_at DESC LIMIT ?", (limit,),
+        stories = [dict(row) for row in db.execute("SELECT * FROM stories")]
+        source_rows = [dict(row) for row in db.execute(
+            "SELECT story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at,"
+            "like_count,retweet_count,reply_count,view_count,author_followers,author_verified,content_type "
+            "FROM story_sources ORDER BY id",
         )]
-        story_ids = [story["id"] for story in stories]
-        if story_ids:
-            placeholders = ",".join("?" for _ in story_ids)
-            source_rows = [dict(row) for row in db.execute(
-                f"SELECT story_id,platform,external_id,region,language,publisher,publisher_domain,title,summary,url,published_at,"
-                f"like_count,retweet_count,reply_count,view_count,author_followers,author_verified,content_type "
-                f"FROM story_sources WHERE story_id IN ({placeholders}) ORDER BY id",
-                story_ids,
-            )]
-        else:
-            source_rows = []
         scans = [dict(row) for row in db.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 12")]
         total_story_count = db.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
         totals = {row["verdict"]: row["count"] for row in db.execute("SELECT verdict,COUNT(*) AS count FROM stories GROUP BY verdict")}
+        urgency_totals = {row["urgency"]: row["count"] for row in db.execute(
+            "SELECT urgency,COUNT(*) AS count FROM stories GROUP BY urgency",
+        )}
+        source_options = [row["platform"] for row in db.execute(
+            "SELECT DISTINCT platform FROM story_sources ORDER BY platform",
+        )]
         last_scan = db.execute("SELECT finished_at FROM scans ORDER BY id DESC LIMIT 1").fetchone()
     public_settings = {key: settings[key] for key in ("scope", "interval_minutes", "ai_base_url", "ai_model")}
     sources_by_story: dict[int, list[dict[str, Any]]] = {}
@@ -1363,7 +1602,7 @@ def dashboard_state(limit: int = 500) -> dict[str, Any]:
             source["quality_status"] == "ineligible" for source in all_sources
         )
         story["relevance_unavailable"] = str(story.get("rationale", "")).startswith((
-            "AI 核验不可用", "未配置 AI 核验", "未配置 OpenRouter API Key",
+            "AI 核验不可用", "未配置 AI 核验", "未配置 AI API Key", "未配置 OpenRouter API Key",
         ))
         primary_is_x = is_x_source({"url": story.get("url", ""), "platform": ""}) or str(
             story.get("source", "")
@@ -1384,12 +1623,22 @@ def dashboard_state(limit: int = 500) -> dict[str, Any]:
                     "published_at": replacement.get("published_at") or story.get("published_at", ""),
                 })
         visible_stories.append(story)
-    stories = visible_stories
+    ai_configured = bool(
+        settings.get("ai_base_url") and settings.get("ai_model")
+        and (not ai_api_key_required(settings.get("ai_base_url", "")) or settings.get("ai_api_key"))
+    )
+    filtered_stories = [story for story in visible_stories if (
+        (urgency == "all" or story.get("urgency", "medium") == urgency)
+        and (source_platform == "all" or any(item.get("platform") == source_platform for item in story["sources"]))
+        and (not minimum_relevance or not ai_configured or story.get("verdict") == "unverified"
+             or int(story.get("relevance_score") or 0) >= minimum_relevance)
+    )]
+    stories = sort_stories(filtered_stories, sort_by)
+    filtered_story_count = len(stories)
+    start = (page - 1) * limit
+    stories = stories[start:start + limit]
     public_settings.update({
-        "ai_configured": bool(
-            settings.get("ai_base_url") and settings.get("ai_model")
-            and ("openrouter.ai" not in settings.get("ai_base_url", "") or settings.get("ai_api_key"))
-        ),
+        "ai_configured": ai_configured,
         "ai_key_saved": bool(settings.get("ai_api_key")),
         "twitter_configured": bool(settings.get("twitter_api_key")),
         "smtp_configured": bool(settings.get("smtp_host") and settings.get("smtp_sender") and settings.get("smtp_recipient")),
@@ -1404,7 +1653,10 @@ def dashboard_state(limit: int = 500) -> dict[str, Any]:
         "telegram_configured": bool(settings.get("telegram_bot_token") and settings.get("telegram_chat_id")),
     })
     return {"keywords": keywords, "stories": stories, "scans": scans, "totals": totals,
+            "urgency_totals": urgency_totals, "source_options": source_options,
             "total_story_count": total_story_count,
+            "filtered_story_count": filtered_story_count, "page": page, "page_size": limit,
+            "has_more": start + len(stories) < filtered_story_count,
             "last_scan": last_scan["finished_at"] if last_scan else None,
             "scan_state": dict(SCAN_STATE), "settings": public_settings}
 
@@ -1432,12 +1684,25 @@ class Handler(BaseHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         path = parsed_path.path
         if path == "/api/state":
-            requested_limit = urllib.parse.parse_qs(parsed_path.query).get("limit", ["500"])[0]
+            query = urllib.parse.parse_qs(parsed_path.query)
+            requested_limit = query.get("pageSize", query.get("limit", ["500"]))[0]
             try:
                 limit = int(requested_limit)
             except ValueError:
                 limit = 500
-            return self._json(200, dashboard_state(limit))
+            try:
+                page = int(query.get("page", ["1"])[0])
+            except ValueError:
+                page = 1
+            try:
+                minimum_relevance = int(query.get("relevance", ["0"])[0])
+            except ValueError:
+                minimum_relevance = 0
+            return self._json(200, dashboard_state(
+                limit=limit, sort_by=query.get("sort", ["recent"])[0], page=page,
+                urgency=query.get("urgency", ["all"])[0], source_platform=query.get("source", ["all"])[0],
+                minimum_relevance=minimum_relevance,
+            ))
         if path == "/api/health":
             return self._json(200, {"ok": True})
         target = WEB_DIR / ("index.html" if path == "/" else path.lstrip("/"))
